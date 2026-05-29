@@ -1,0 +1,3 @@
+Explain speculative decoding in one sentence.
+Write a tiny Python function that adds two numbers.
+Why does a draft model need target verification?

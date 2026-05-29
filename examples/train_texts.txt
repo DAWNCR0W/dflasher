@@ -1,0 +1,5 @@
+DFlash draft models propose future tokens and a target model verifies them.
+Speculative decoding remains exact when rejected draft tokens are replaced by target tokens.
+The command line interface trains, saves, loads, generates, and evaluates a draft model.
+Small Hugging Face models make fast smoke tests for local development.
+The draft model sees one clean anchor token and predicts the rest of the block in parallel.

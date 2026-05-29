@@ -1,0 +1,41 @@
+name: Bug report
+description: Report a reproducible problem in dflasher.
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a problem. Please avoid sharing private model tokens,
+        proprietary prompts, or generated checkpoints.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: Describe the behavior and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Reproduction steps
+      description: Include the smallest command or script that reproduces the issue.
+      placeholder: |
+        1. Run `dflasher ...`
+        2. Observe ...
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Include OS, Python, torch, transformers, vLLM, CUDA/MPS/MLX, and model IDs when relevant.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Paste the relevant traceback or command output.
+      render: text
