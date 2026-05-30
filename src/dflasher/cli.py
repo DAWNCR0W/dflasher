@@ -40,6 +40,8 @@ from dflasher.official import (
     write_pipeline_script,
 )
 from dflasher.omlx import (
+    OMLX_MODEL_ROOT,
+    OMLX_MODEL_SETTINGS_PATH,
     OmlxBuildOptions,
     OmlxCacheMetadata,
     build_omlx_draft,
@@ -47,7 +49,10 @@ from dflasher.omlx import (
     extract_omlx_hidden_cache,
     generate_omlx_dflash,
     init_omlx_draft,
+    install_omlx_draft_for_app,
     make_omlx_draft_config,
+    native_omlx_dflash_compatibility,
+    patch_omlx_app_for_minimax,
     read_model_config,
     train_omlx_draft_from_cache,
 )
@@ -355,6 +360,14 @@ def build(
         int,
         typer.Option(help="OMLX draft mask token id."),
     ] = 0,
+    omlx_loss_fn: Annotated[
+        str,
+        typer.Option(help="OMLX training loss: hidden-mse, ce, or ce-hidden."),
+    ] = "ce-hidden",
+    omlx_hidden_loss_weight: Annotated[
+        float,
+        typer.Option(help="Hidden-state MSE weight when --omlx-loss-fn=ce-hidden."),
+    ] = 0.01,
 ):
     """Build a draft model from a source model.
 
@@ -452,6 +465,8 @@ def build(
                 mask_token_id=omlx_mask_token_id,
                 max_steps=max_steps,
                 learning_rate=learning_rate,
+                loss_fn=omlx_loss_fn,
+                hidden_loss_weight=omlx_hidden_loss_weight,
                 seed=seed,
                 overwrite=overwrite,
                 train=not plan_only,
@@ -836,6 +851,18 @@ def omlx_train(
     draft_dir: Annotated[Path, typer.Argument(help="OMLX DFlash draft directory.")],
     max_steps: Annotated[int, typer.Option(help="Training optimizer steps.")] = 20,
     learning_rate: Annotated[float, typer.Option(help="AdamW learning rate.")] = 1e-4,
+    source_model: Annotated[
+        str | None,
+        typer.Option(help="Source model path/id for CE loss. Defaults to cache metadata."),
+    ] = None,
+    loss_fn: Annotated[
+        str,
+        typer.Option(help="OMLX training loss: hidden-mse, ce, or ce-hidden."),
+    ] = "ce-hidden",
+    hidden_loss_weight: Annotated[
+        float,
+        typer.Option(help="Hidden-state MSE weight when --loss-fn=ce-hidden."),
+    ] = 0.01,
     seed: Annotated[int, typer.Option(help="Random seed.")] = 13,
 ):
     """Train the OMLX draft from an extracted hidden-state cache."""
@@ -845,6 +872,9 @@ def omlx_train(
             draft_dir=draft_dir,
             max_steps=max_steps,
             learning_rate=learning_rate,
+            source_model=source_model,
+            loss_fn=loss_fn,
+            hidden_loss_weight=hidden_loss_weight,
             seed=seed,
         )
     except (RuntimeError, ValueError) as exc:
@@ -881,6 +911,14 @@ def omlx_build(
     mask_token_id: Annotated[int, typer.Option(help="Draft mask token id.")] = 0,
     max_steps: Annotated[int, typer.Option(help="Training optimizer steps.")] = 20,
     learning_rate: Annotated[float, typer.Option(help="AdamW learning rate.")] = 1e-4,
+    loss_fn: Annotated[
+        str,
+        typer.Option(help="OMLX training loss: hidden-mse, ce, or ce-hidden."),
+    ] = "ce-hidden",
+    hidden_loss_weight: Annotated[
+        float,
+        typer.Option(help="Hidden-state MSE weight when --loss-fn=ce-hidden."),
+    ] = 0.01,
     seed: Annotated[int, typer.Option(help="Random seed.")] = 13,
     overwrite: Annotated[bool, typer.Option(help="Replace existing outputs.")] = False,
     skip_train: Annotated[
@@ -909,6 +947,8 @@ def omlx_build(
             mask_token_id=mask_token_id,
             max_steps=max_steps,
             learning_rate=learning_rate,
+            loss_fn=loss_fn,
+            hidden_loss_weight=hidden_loss_weight,
             seed=seed,
             overwrite=overwrite,
             train=not skip_train,
@@ -966,10 +1006,130 @@ def omlx_eval(
         raise typer.Exit(code=1) from exc
     console.print(
         f"Exact matches: {result.exact_matches}/{result.prompts}; "
-        f"mean acceptance: {result.mean_acceptance:.2f}"
+        f"mean acceptance: {result.mean_acceptance:.2f}; "
+        f"draft acceptance: {result.mean_draft_acceptance:.2f}; "
+        f"max prompt tokens: {result.max_prompt_tokens}"
     )
     if result.exact_matches != result.prompts:
         raise typer.Exit(code=1)
+
+
+@omlx_app.command("compat")
+def omlx_compat(
+    source_model: Annotated[str, typer.Argument(help="Local OMLX/MLX source model directory.")],
+):
+    """Check native oMLX DFlash compatibility for a source model."""
+    try:
+        compatible, reason = native_omlx_dflash_compatibility(source_model)
+    except ValueError as exc:
+        _exit_invalid_config(exc)
+    if compatible:
+        console.print("compatible" if not reason else f"compatible: {reason}")
+    else:
+        console.print(f"incompatible: {reason}")
+    if not compatible:
+        raise typer.Exit(code=1)
+
+
+@omlx_app.command("patch-app")
+def omlx_patch_app(
+    app_path: Annotated[
+        Path,
+        typer.Option(help="Installed oMLX.app bundle path."),
+    ] = Path("/Applications/oMLX.app"),
+    overwrite_target_backend: Annotated[
+        bool,
+        typer.Option(help="Rewrite the bundled MiniMax-M2 target backend file."),
+    ] = False,
+    dry_run: Annotated[
+        bool,
+        typer.Option(help="Report files that would change without writing them."),
+    ] = False,
+):
+    """Patch the installed oMLX app so MiniMax-M2 can use DFlashEngine."""
+    try:
+        result = patch_omlx_app_for_minimax(
+            app_path=app_path,
+            overwrite_target_backend=overwrite_target_backend,
+            dry_run=dry_run,
+        )
+    except (OSError, ValueError) as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1) from exc
+    table = Table(title="oMLX app MiniMax-M2 DFlash patch")
+    table.add_column("field")
+    table.add_column("value")
+    table.add_row("app_path", str(result.app_path))
+    table.add_row("target_ops", str(result.target_ops_path))
+    table.add_row("target_backend", str(result.target_backend_path))
+    table.add_row("dflash_engine", str(result.dflash_engine_path))
+    table.add_row("changed", "none" if not result.changed_paths else str(len(result.changed_paths)))
+    for path in result.changed_paths:
+        table.add_row("changed_path", str(path))
+    console.print(table)
+
+
+@omlx_app.command("install-app")
+def omlx_install_app(
+    source_model: Annotated[str, typer.Argument(help="Local OMLX/MLX source model directory.")],
+    draft_dir: Annotated[Path, typer.Argument(help="OMLX DFlash draft directory.")],
+    installed_name: Annotated[
+        str | None,
+        typer.Option(help="Directory name under ~/.omlx/models for the installed draft."),
+    ] = None,
+    settings_path: Annotated[
+        Path,
+        typer.Option(help="Path to the local oMLX model_settings.json file."),
+    ] = OMLX_MODEL_SETTINGS_PATH,
+    model_root: Annotated[
+        Path,
+        typer.Option(help="oMLX model root used when copying the draft."),
+    ] = OMLX_MODEL_ROOT,
+    no_copy: Annotated[
+        bool,
+        typer.Option(
+            help="Point model settings at draft_dir instead of copying to ~/.omlx/models."
+        ),
+    ] = False,
+    overwrite: Annotated[
+        bool,
+        typer.Option(help="Replace an existing installed draft directory."),
+    ] = False,
+    ssd_cache: Annotated[
+        bool,
+        typer.Option("--ssd-cache/--no-ssd-cache", help="Enable oMLX DFlash SSD cache."),
+    ] = True,
+    verify_mode: Annotated[
+        str,
+        typer.Option(help="DFlash verify mode passed to oMLX."),
+    ] = "adaptive",
+):
+    """Install a draft into local oMLX model settings."""
+    try:
+        result = install_omlx_draft_for_app(
+            source_model=source_model,
+            draft_dir=draft_dir,
+            installed_name=installed_name,
+            settings_path=settings_path,
+            model_root=model_root,
+            copy_draft=not no_copy,
+            overwrite=overwrite,
+            ssd_cache=ssd_cache,
+            verify_mode=verify_mode,
+        )
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1) from exc
+    table = Table(title="oMLX DFlash settings")
+    table.add_column("field")
+    table.add_column("value")
+    table.add_row("source_model", result.source_model)
+    table.add_row("draft_model", result.draft_model)
+    table.add_row("settings_path", str(result.settings_path))
+    table.add_row("native_compatible", str(result.compatible_with_native_omlx))
+    if result.compatibility_reason:
+        table.add_row("compatibility_reason", result.compatibility_reason)
+    console.print(table)
 
 
 @omlx_app.command("cache-info")

@@ -73,6 +73,13 @@ runtime:
 pip install -e ".[dev,mac,zlab-mlx]"
 ```
 
+If you serve MiniMax-M2 through the installed macOS oMLX app, patch the local
+app bundle once so its DFlash engine can resolve MiniMax-M2 target ops:
+
+```bash
+dflasher omlx patch-app --app-path /Applications/oMLX.app
+```
+
 For actual vLLM serving/training on Linux/CUDA, install the vLLM extra in that
 CUDA environment:
 
@@ -197,13 +204,13 @@ including MiniMaxM2-style local checkpoints.
 Inspect a local source model without loading all weights:
 
 ```bash
-dflasher omlx inspect ~/.omlx/models/MiniMax-M2.7-BF16-ultra-uncensored-heretic-oQ4
+dflasher omlx inspect ~/.omlx/models/MiniMax-M2.7-ultra-uncensored-heretic-oQ4-MLX
 ```
 
 Build a local MLX DFlash draft:
 
 ```bash
-dflasher omlx build ~/.omlx/models/MiniMax-M2.7-BF16-ultra-uncensored-heretic-oQ4 \
+dflasher omlx build ~/.omlx/models/MiniMax-M2.7-ultra-uncensored-heretic-oQ4-MLX \
   --texts-file examples/train_texts.txt \
   --out ./runs/minimax-m27-oq4-dflash \
   --cache-dir ./runs/minimax-m27-oq4-cache \
@@ -218,7 +225,7 @@ dflasher omlx build ~/.omlx/models/MiniMax-M2.7-BF16-ultra-uncensored-heretic-oQ
 The same backend is also available through the product entry point:
 
 ```bash
-dflasher build ~/.omlx/models/MiniMax-M2.7-BF16-ultra-uncensored-heretic-oQ4 \
+dflasher build ~/.omlx/models/MiniMax-M2.7-ultra-uncensored-heretic-oQ4-MLX \
   --backend omlx \
   --texts-file examples/train_texts.txt \
   --out ./runs/minimax-m27-oq4-dflash \
@@ -234,10 +241,20 @@ dflasher build ~/.omlx/models/MiniMax-M2.7-BF16-ultra-uncensored-heretic-oQ4 \
 Verify target-equivalent greedy decoding with the local OMLX verifier:
 
 ```bash
-dflasher omlx eval ~/.omlx/models/MiniMax-M2.7-BF16-ultra-uncensored-heretic-oQ4 \
+dflasher omlx eval ~/.omlx/models/MiniMax-M2.7-ultra-uncensored-heretic-oQ4-MLX \
   ./runs/minimax-m27-oq4-dflash \
   --prompt "Explain speculative decoding in one sentence." \
   --max-new-tokens 16
+```
+
+Install the draft into the local oMLX model settings for app/API serving:
+
+```bash
+dflasher omlx patch-app --app-path /Applications/oMLX.app
+dflasher omlx install-app \
+  ~/.omlx/models/MiniMax-M2.7-ultra-uncensored-heretic-oQ4-MLX \
+  ./runs/minimax-m27-oq4-dflash \
+  --overwrite
 ```
 
 This backend is intentionally explicit: cache extraction loads the source model,

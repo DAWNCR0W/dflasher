@@ -12,12 +12,16 @@ license = { text = "MIT" }
 authors = [{ name = "dflasher contributors" }]
 keywords = [
   "dflash",
+  "dflash-mlx",
   "draft-model",
   "huggingface",
   "llm",
   "llm-inference",
+  "minimax",
   "mlx",
+  "mlx-lm",
   "omlx",
+  "qwen",
   "speculative-decoding",
   "transformers",
   "vllm",
