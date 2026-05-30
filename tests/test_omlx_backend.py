@@ -9,6 +9,9 @@ from dflasher.omlx import (
     OMLX_CACHE_FORMAT,
     OmlxBuildOptions,
     OmlxCacheMetadata,
+    _runtime_aligned_anchor_bounds,
+    _runtime_aligned_segment_start,
+    _runtime_aligned_training_arrays,
     install_omlx_draft_for_app,
     make_omlx_draft_config,
     native_omlx_dflash_compatibility,
@@ -86,10 +89,12 @@ def test_omlx_minimax_config_resolves_zlab_layers(tmp_path):
         str(model_dir),
         block_size=8,
         draft_layers=2,
+        intermediate_size=2048,
     )
 
     assert config.target_layer_ids == (1, 13, 24, 36, 47, 59)
     assert config.hidden_size == 3072
+    assert config.intermediate_size == 2048
     assert config.num_key_value_heads == 8
     assert config.num_hidden_layers == 2
     assert config.draft_format == "dflasher.omlx-dflash"
@@ -138,6 +143,118 @@ def test_omlx_cache_metadata_roundtrip(tmp_path):
     assert OmlxCacheMetadata.load(tmp_path) == metadata
 
 
+def test_omlx_training_window_matches_live_dflash_runtime():
+    import numpy as np
+
+    metadata = OmlxCacheMetadata(
+        source_model="/models/minimax",
+        cache_format=OMLX_CACHE_FORMAT,
+        selected_layer_ids=(1, 13),
+        hidden_size=2,
+        context_width=4,
+        vocab_size=128,
+        block_size=4,
+        mask_token_id=0,
+        max_length=8,
+        samples=1,
+        files=("sample_00000.npz",),
+        dtype="float16",
+    )
+    sample = {
+        "tokens": np.arange(12),
+        "context_hidden": np.arange(12 * 4).reshape(12, 4),
+        "target_hidden": np.arange(100, 100 + 12 * 2).reshape(12, 2),
+        "token_embeddings": np.arange(200, 200 + 12 * 2).reshape(12, 2),
+        "mask_embedding": np.array([999, 1000]),
+        "min_anchor": np.array(3),
+    }
+
+    window = _runtime_aligned_training_arrays(sample, metadata, anchor=6, segment_start=4)
+
+    assert window["cache_context_hidden"].tolist() == sample["context_hidden"][:4].tolist()
+    assert window["context_hidden"].tolist() == sample["context_hidden"][4:6].tolist()
+    assert window["target_hidden"].tolist() == sample["target_hidden"][7:10].tolist()
+    assert window["label_tokens"].tolist() == [7, 8, 9]
+    assert window["anchor_embedding"].tolist() == sample["token_embeddings"][6].tolist()
+    assert window["mask_embedding"].tolist() == [999, 1000]
+
+
+def test_omlx_training_window_uses_prompt_segment_for_first_cycle():
+    import numpy as np
+
+    metadata = OmlxCacheMetadata(
+        source_model="/models/minimax",
+        cache_format=OMLX_CACHE_FORMAT,
+        selected_layer_ids=(1, 13),
+        hidden_size=2,
+        context_width=4,
+        vocab_size=128,
+        block_size=4,
+        mask_token_id=0,
+        max_length=8,
+        samples=1,
+        files=("sample_00000.npz",),
+        dtype="float16",
+    )
+    sample = {
+        "tokens": np.arange(8),
+        "context_hidden": np.arange(8 * 4).reshape(8, 4),
+        "target_hidden": np.arange(100, 100 + 8 * 2).reshape(8, 2),
+        "token_embeddings": np.arange(200, 200 + 8 * 2).reshape(8, 2),
+        "mask_embedding": np.array([999, 1000]),
+        "min_anchor": np.array(3),
+    }
+
+    window = _runtime_aligned_training_arrays(sample, metadata, anchor=3)
+
+    assert window["cache_context_hidden"].tolist() == []
+    assert window["context_hidden"].tolist() == sample["context_hidden"][:3].tolist()
+
+
+def test_omlx_training_window_requires_prefix_before_anchor():
+    assert _runtime_aligned_anchor_bounds(token_count=8, block_size=4) == (1, 4)
+    assert _runtime_aligned_anchor_bounds(token_count=12, block_size=4, min_anchor=5) == (5, 8)
+
+    try:
+        _runtime_aligned_anchor_bounds(token_count=4, block_size=4)
+    except ValueError as exc:
+        assert "too short" in str(exc)
+    else:
+        raise AssertionError("accepted a sample without prefix context before the anchor")
+
+
+def test_omlx_training_segment_start_mirrors_runtime_cache_split():
+    import random
+
+    import numpy as np
+
+    metadata = OmlxCacheMetadata(
+        source_model="/models/minimax",
+        cache_format=OMLX_CACHE_FORMAT,
+        selected_layer_ids=(1, 13),
+        hidden_size=2,
+        context_width=4,
+        vocab_size=128,
+        block_size=4,
+        mask_token_id=0,
+        max_length=12,
+        samples=1,
+        files=("sample_00000.npz",),
+        dtype="float16",
+    )
+    sample = {"tokens": np.arange(12), "min_anchor": np.array(5)}
+
+    assert _runtime_aligned_segment_start(sample, metadata, anchor=5, rng=random.Random(1)) == 0
+    segment_start = _runtime_aligned_segment_start(
+        sample,
+        metadata,
+        anchor=8,
+        rng=random.Random(1),
+    )
+
+    assert 5 <= segment_start < 8
+
+
 def test_cli_omlx_inspect_reads_local_config(tmp_path):
     model_dir = write_minimax_config(tmp_path / "model")
     runner = CliRunner()
@@ -180,6 +297,8 @@ def test_build_backend_omlx_delegates_to_omlx_builder(monkeypatch, tmp_path):
             "hidden-mse",
             "--omlx-hidden-loss-weight",
             "0.0",
+            "--omlx-intermediate-size",
+            "2048",
             "--plan-only",
         ],
     )
@@ -190,6 +309,7 @@ def test_build_backend_omlx_delegates_to_omlx_builder(monkeypatch, tmp_path):
     assert calls["options"].max_samples == 2
     assert calls["options"].loss_fn == "hidden-mse"
     assert calls["options"].hidden_loss_weight == 0.0
+    assert calls["options"].intermediate_size == 2048
     assert calls["options"].train is False
     assert "OMLX DFlash draft" in result.output
 
@@ -232,6 +352,34 @@ def test_install_omlx_draft_rejects_installed_name_path_escape(tmp_path):
         assert "single directory name" in str(exc)
     else:
         raise AssertionError("accepted an installed_name that escapes the model root")
+
+
+def test_install_omlx_draft_rejects_protected_installed_name_without_deleting(tmp_path):
+    model_dir = write_minimax_config(tmp_path / "MiniMax-M2.7-oQ4")
+    draft_dir = write_minimax_draft_config(tmp_path / "draft", model_dir)
+    model_root = tmp_path / "models"
+    protected_dir = model_root / "Qwen3.6-35B-A3B-DFlash"
+    protected_dir.mkdir(parents=True)
+    marker = protected_dir / "keep.txt"
+    marker.write_text("do not delete")
+    settings_path = tmp_path / "model_settings.json"
+
+    try:
+        install_omlx_draft_for_app(
+            source_model=str(model_dir),
+            draft_dir=draft_dir,
+            settings_path=settings_path,
+            model_root=model_root,
+            installed_name=protected_dir.name,
+            overwrite=True,
+        )
+    except ValueError as exc:
+        assert "protected oMLX draft" in str(exc)
+    else:
+        raise AssertionError("accepted a protected installed draft name")
+
+    assert marker.read_text() == "do not delete"
+    assert not settings_path.exists()
 
 
 def test_install_omlx_draft_rejects_mismatched_source(tmp_path):

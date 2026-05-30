@@ -5,6 +5,7 @@ import os
 import random
 import re
 import shutil
+import sys
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -31,6 +32,12 @@ OMLX_MODEL_ROOT = Path.home() / ".omlx" / "models"
 OMLX_MODEL_SETTINGS_PATH = Path.home() / ".omlx" / "model_settings.json"
 DEFAULT_OMLX_APP_PATH = Path("/Applications/oMLX.app")
 MINIMAX_M2_TARGET_BACKEND = "dflash_mlx.engine.target_minimax_m2:MiniMaxM2TargetOps"
+PROTECTED_OMLX_DRAFT_NAMES = frozenset(
+    {
+        "Qwen3.6-35B-A3B-DFlash",
+        "Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive-text-oQ8",
+    }
+)
 
 OMLX_LOSS_HIDDEN_MSE = "hidden-mse"
 OMLX_LOSS_CE = "ce"
@@ -379,6 +386,7 @@ class OmlxBuildOptions:
     max_length: int = 128
     block_size: int = 8
     draft_layers: int = 2
+    intermediate_size: int | None = None
     layer_policy: str = "auto"
     target_layer_ids: tuple[int, ...] | None = None
     mask_token_id: int = 0
@@ -399,6 +407,8 @@ class OmlxBuildOptions:
             raise ValueError("block_size must be at least 2.")
         if self.draft_layers < 1:
             raise ValueError("draft_layers must be at least 1.")
+        if self.intermediate_size is not None and self.intermediate_size < 1:
+            raise ValueError("intermediate_size must be positive.")
         if self.max_steps < 0:
             raise ValueError("max_steps must be non-negative.")
         if self.learning_rate <= 0:
@@ -440,6 +450,14 @@ class OmlxAppPatchResult:
     changed_paths: tuple[Path, ...]
 
 
+@dataclass(frozen=True)
+class _DFlashMlxRuntime:
+    flavor: str
+    config_class: Any
+    draft_model_class: Any
+    stream_generate: Any | None
+
+
 class _LayerHook:
     def __init__(self, layer: Any, index: int, storage: list[Any]) -> None:
         self._layer = layer
@@ -470,15 +488,51 @@ def _import_mlx():
     return mx, nn, optim, mlx_lm_load, make_prompt_cache, make_sampler
 
 
-def _import_dflash_mlx():
+def _omlx_app_site_packages(app_path: str | Path = DEFAULT_OMLX_APP_PATH) -> tuple[Path, ...]:
+    app = Path(app_path).expanduser()
+    contents = app / "Contents"
+    if not contents.exists():
+        return ()
+    return tuple(
+        sorted(contents.glob("Python/framework-mlx-framework/lib/python*/site-packages"))
+    )
+
+
+def _ensure_omlx_app_site_packages() -> None:
+    explicit = os.environ.get("DFLASHER_DFLASH_MLX_SITE_PACKAGES")
+    candidates = [Path(explicit).expanduser()] if explicit else list(_omlx_app_site_packages())
+    for candidate in candidates:
+        if candidate.exists() and str(candidate) not in sys.path:
+            sys.path.insert(0, str(candidate))
+
+
+def _import_dflash_mlx() -> _DFlashMlxRuntime:
+    _ensure_omlx_app_site_packages()
+    try:
+        from dflash_mlx.model import DFlashDraftModel, DFlashDraftModelArgs
+
+        return _DFlashMlxRuntime(
+            flavor="dflash_mlx",
+            config_class=DFlashDraftModelArgs,
+            draft_model_class=DFlashDraftModel,
+            stream_generate=None,
+        )
+    except ImportError:
+        pass
     try:
         from dflash.model_mlx import DFlashConfig, DFlashDraftModel, stream_generate
     except ImportError as exc:
         raise RuntimeError(
-            "OMLX DFlash runtime requires z-lab dflash MLX support: "
-            "pip install -e '.[zlab-mlx]'"
+            "OMLX DFlash runtime requires either the oMLX bundled dflash_mlx runtime "
+            "or z-lab dflash MLX support. Install oMLX.app, set "
+            "DFLASHER_DFLASH_MLX_SITE_PACKAGES, or run: pip install -e '.[zlab-mlx]'"
         ) from exc
-    return DFlashConfig, DFlashDraftModel, stream_generate
+    return _DFlashMlxRuntime(
+        flavor="zlab",
+        config_class=DFlashConfig,
+        draft_model_class=DFlashDraftModel,
+        stream_generate=stream_generate,
+    )
 
 
 def _model_name_tokens(value: str) -> set[str]:
@@ -578,6 +632,7 @@ def make_omlx_draft_config(
     source_model: str,
     block_size: int,
     draft_layers: int,
+    intermediate_size: int | None = None,
     layer_policy: str = "auto",
     target_layer_ids: tuple[int, ...] | None = None,
     mask_token_id: int = 0,
@@ -588,6 +643,11 @@ def make_omlx_draft_config(
     config = read_model_config(source_model)
     selected_layer_ids = resolve_omlx_layer_ids(source_model, layer_policy, target_layer_ids)
     hidden_size = int(_config_value(config, "hidden_size"))
+    resolved_intermediate_size = (
+        int(intermediate_size)
+        if intermediate_size is not None
+        else int(_config_value(config, "intermediate_size", hidden_size * 4))
+    )
     layer_types = tuple("full_attention" for _ in range(draft_layers))
     return OmlxDraftConfig(
         source_model=source_model,
@@ -596,7 +656,7 @@ def make_omlx_draft_config(
         num_attention_heads=_num_attention_heads(config),
         num_key_value_heads=_num_key_value_heads(config),
         head_dim=_head_dim(config),
-        intermediate_size=int(_config_value(config, "intermediate_size", hidden_size * 4)),
+        intermediate_size=resolved_intermediate_size,
         vocab_size=int(_config_value(config, "vocab_size")),
         rms_norm_eps=float(_config_value(config, "rms_norm_eps", 1e-6)),
         rope_theta=float(_config_value(config, "rope_theta", 1_000_000.0)),
@@ -615,8 +675,10 @@ def make_omlx_draft_config(
 
 
 def _to_dflash_config(config: OmlxDraftConfig):
-    DFlashConfig, _DFlashDraftModel, _stream_generate = _import_dflash_mlx()
-    return DFlashConfig(
+    runtime = _import_dflash_mlx()
+    if runtime.flavor == "dflash_mlx":
+        return runtime.config_class.from_dict(_config_payload(config))
+    return runtime.config_class(
         hidden_size=config.hidden_size,
         num_hidden_layers=config.num_hidden_layers,
         num_attention_heads=config.num_attention_heads,
@@ -691,6 +753,7 @@ def init_omlx_draft(
     output_dir: Path,
     block_size: int = 8,
     draft_layers: int = 2,
+    intermediate_size: int | None = None,
     layer_policy: str = "auto",
     target_layer_ids: tuple[int, ...] | None = None,
     mask_token_id: int = 0,
@@ -708,14 +771,15 @@ def init_omlx_draft(
         source_model=source_model,
         block_size=block_size,
         draft_layers=draft_layers,
+        intermediate_size=intermediate_size,
         layer_policy=layer_policy,
         target_layer_ids=target_layer_ids,
         mask_token_id=mask_token_id,
         training_data_source=training_data_source,
         training_objective=training_objective,
     )
-    _DFlashConfig, DFlashDraftModel, _stream_generate = _import_dflash_mlx()
-    draft = DFlashDraftModel(_to_dflash_config(config))
+    runtime = _import_dflash_mlx()
+    draft = runtime.draft_model_class(_to_dflash_config(config))
     (output_dir / "config.json").write_text(json.dumps(_config_payload(config), indent=2) + "\n")
     draft.save_weights(str(output_dir / "model.safetensors"))
     return output_dir
@@ -754,8 +818,8 @@ def read_omlx_draft_config(draft_dir: str | Path) -> OmlxDraftConfig:
 def load_omlx_draft(draft_dir: str | Path):
     path = Path(draft_dir)
     config = read_omlx_draft_config(path)
-    _DFlashConfig, DFlashDraftModel, _stream_generate = _import_dflash_mlx()
-    draft = DFlashDraftModel(_to_dflash_config(config))
+    runtime = _import_dflash_mlx()
+    draft = runtime.draft_model_class(_to_dflash_config(config))
     draft.load_weights(str(path / "model.safetensors"))
     return draft
 
@@ -806,7 +870,9 @@ def capture_selected_layers(model, layer_ids: tuple[int, ...]) -> Iterator[list[
 
 
 def _encode_text(tokenizer, text: str, max_length: int) -> list[int]:
-    tokens = tokenizer.encode(text, add_special_tokens=True)
+    bos_token = getattr(tokenizer, "bos_token", None)
+    add_special_tokens = bos_token is None or not text.startswith(str(bos_token))
+    tokens = tokenizer.encode(text, add_special_tokens=add_special_tokens)
     return [int(token) for token in tokens[:max_length]]
 
 
@@ -933,7 +999,130 @@ def _load_cache_arrays(cache_dir: Path, metadata: OmlxCacheMetadata) -> list[dic
     return samples
 
 
+def _runtime_aligned_anchor_bounds(
+    token_count: int,
+    block_size: int,
+    min_anchor: int = 1,
+) -> tuple[int, int]:
+    min_anchor = max(1, int(min_anchor))
+    max_anchor = token_count - block_size
+    if max_anchor < min_anchor:
+        raise ValueError(
+            "Cache sample is too short for runtime-aligned OMLX DFlash training: "
+            f"token_count={token_count}, block_size={block_size}, min_anchor={min_anchor}"
+        )
+    return min_anchor, max_anchor
+
+
+def _sample_min_anchor(sample: dict[str, np.ndarray]) -> int:
+    raw = sample.get("min_anchor")
+    if raw is None:
+        return 1
+    return int(np.asarray(raw).reshape(()).item())
+
+
+def _runtime_aligned_training_arrays(
+    sample: dict[str, np.ndarray],
+    metadata: OmlxCacheMetadata,
+    anchor: int,
+    segment_start: int | None = None,
+) -> dict[str, np.ndarray]:
+    """Build the same draft inputs used by live DFlash decoding.
+
+    During serving, DFlash has verifier hidden states only for the prefix before
+    the staged anchor token. The anchor token itself is passed as an embedding to
+    the draft. Training must mirror that boundary; including the anchor hidden
+    state leaks information that the runtime does not have and produces drafts
+    that look good only under teacher forcing.
+
+    Live oMLX keeps older verifier context in the draft KV cache. After the first
+    cycle it passes only the newly committed context segment into the draft. The
+    optional ``segment_start`` separates those two parts so training sees the
+    same cache/context split as serving.
+    """
+
+    min_anchor, max_anchor = _runtime_aligned_anchor_bounds(
+        int(sample["tokens"].shape[0]),
+        metadata.block_size,
+        _sample_min_anchor(sample),
+    )
+    if anchor < min_anchor or anchor > max_anchor:
+        raise ValueError(f"anchor must be in [{min_anchor}, {max_anchor}], got {anchor}")
+    if segment_start is None:
+        segment_start = 0 if anchor == min_anchor else max(min_anchor, anchor - metadata.block_size)
+    segment_start = int(segment_start)
+    if segment_start < 0 or segment_start > anchor:
+        raise ValueError(f"segment_start must be in [0, {anchor}], got {segment_start}")
+    if anchor == min_anchor and segment_start != 0:
+        raise ValueError(
+            "the first DFlash cycle must use the prompt as the current context segment"
+        )
+    if anchor > min_anchor and segment_start < min_anchor:
+        raise ValueError("generated DFlash cycles must keep the prompt context in the draft cache")
+    label_start = anchor + 1
+    label_end = anchor + metadata.block_size
+    return {
+        "cache_context_hidden": sample["context_hidden"][:segment_start],
+        "context_hidden": sample["context_hidden"][segment_start:anchor],
+        "target_hidden": sample["target_hidden"][label_start:label_end],
+        "label_tokens": sample["tokens"][label_start:label_end],
+        "anchor_embedding": sample["token_embeddings"][anchor],
+        "mask_embedding": sample["mask_embedding"],
+    }
+
+
+def _runtime_aligned_segment_start(
+    sample: dict[str, np.ndarray],
+    metadata: OmlxCacheMetadata,
+    anchor: int,
+    rng: random.Random,
+) -> int:
+    min_anchor = _sample_min_anchor(sample)
+    if anchor == min_anchor:
+        return 0
+    max_segment_len = min(metadata.block_size, anchor - min_anchor)
+    segment_len = rng.randint(1, max_segment_len)
+    return anchor - segment_len
+
+
+def _make_draft_cache(draft):
+    if hasattr(draft, "make_cache"):
+        return draft.make_cache()
+    _ensure_omlx_app_site_packages()
+    try:
+        from dflash_mlx.draft_backend import EagerDraftBackend
+    except ImportError as exc:
+        raise RuntimeError("dflash_mlx draft cache support is unavailable.") from exc
+    return EagerDraftBackend().make_cache(
+        draft_model=draft,
+        sink_size=64,
+        window_size=1024,
+        allow_full_context_layers=False,
+    )
+
+
+def _advance_draft_cache_with_context(draft, cache, target_hidden) -> None:
+    if int(target_hidden.shape[1]) <= 0:
+        return
+    if hasattr(draft, "advance_projected_context_cache") and hasattr(
+        draft,
+        "project_target_hidden",
+    ):
+        draft.advance_projected_context_cache(
+            draft_context=draft.project_target_hidden(target_hidden),
+            cache=cache,
+        )
+        return
+    raise RuntimeError("This DFlash runtime cannot train with split draft context caching.")
+
+
 def _direct_draft_hidden(draft, block_embeddings, target_hidden, cache):
+    if hasattr(draft, "forward_projected_context") and hasattr(draft, "project_target_hidden"):
+        return draft.forward_projected_context(
+            noise_embedding=block_embeddings,
+            draft_context=draft.project_target_hidden(target_hidden),
+            cache=cache,
+        )
     h = block_embeddings * getattr(draft, "embed_scale", 1.0)
     h_ctx = draft.hidden_norm(draft.fc(target_hidden))
     for layer, layer_cache in zip(draft.layers, cache, strict=True):
@@ -946,6 +1135,18 @@ def _softcap_logits(logits, cap: float | None):
         return logits
     mx, _nn, _optim, _mlx_lm_load, _make_prompt_cache, _make_sampler = _import_mlx()
     return mx.tanh(logits / cap) * cap
+
+
+def _bind_dflash_mlx_draft_to_target(draft, target_model) -> None:
+    if not hasattr(draft, "bind_target_model"):
+        return
+    _ensure_omlx_app_site_packages()
+    try:
+        from dflash_mlx.engine.target_ops import resolve_target_ops
+    except ImportError as exc:
+        raise RuntimeError("dflash_mlx target binding support is unavailable.") from exc
+    target_ops = resolve_target_ops(target_model)
+    draft.bind_target_model(target_model, target_ops=target_ops)
 
 
 def _verify_cache_matches_draft(metadata: OmlxCacheMetadata, draft_config: OmlxDraftConfig) -> None:
@@ -1005,6 +1206,7 @@ def train_omlx_draft_from_cache(
     rng = random.Random(seed)
     optimizer = optim.AdamW(learning_rate=learning_rate)
     lm_head = None
+    target_model = None
     if loss_name in {OMLX_LOSS_CE, OMLX_LOSS_CE_HIDDEN}:
         target_ref = resolve_omlx_source_model(source_model or metadata.source_model)
         console.print(f"[bold]Loading OMLX target lm_head for CE loss[/bold] {target_ref}")
@@ -1012,9 +1214,31 @@ def train_omlx_draft_from_cache(
         if hasattr(target_model, "eval"):
             target_model.eval()
         lm_head = _get_lm_head(target_model)
+    if target_model is not None:
+        _bind_dflash_mlx_draft_to_target(draft, target_model)
 
-    def loss_fn_inner(model, context_hidden, block_embeddings, label_hidden, label_tokens):
-        hidden = _direct_draft_hidden(model, block_embeddings, context_hidden, model.make_cache())
+    supports_split_context_cache = hasattr(draft, "advance_projected_context_cache") and hasattr(
+        draft,
+        "project_target_hidden",
+    )
+
+    def loss_fn_inner(
+        model,
+        cache_context_hidden,
+        context_hidden,
+        block_embeddings,
+        label_hidden,
+        label_tokens,
+    ):
+        draft_cache = _make_draft_cache(model)
+        if int(cache_context_hidden.shape[1]) > 0:
+            _advance_draft_cache_with_context(model, draft_cache, cache_context_hidden)
+        hidden = _direct_draft_hidden(
+            model,
+            block_embeddings,
+            context_hidden,
+            draft_cache,
+        )
         pred = hidden[:, 1:, :]
         hidden_loss = ((pred - label_hidden) ** 2).mean()
         if loss_name == OMLX_LOSS_HIDDEN_MSE:
@@ -1032,18 +1256,32 @@ def train_omlx_draft_from_cache(
     for _ in progress:
         sample = rng.choice(samples)
         token_count = int(sample["tokens"].shape[0])
-        max_anchor = token_count - metadata.block_size
-        anchor = rng.randint(0, max_anchor)
-        context_hidden = mx.array(sample["context_hidden"][: anchor + 1][None, :, :])
-        target_hidden = mx.array(
-            sample["target_hidden"][anchor + 1 : anchor + metadata.block_size][None, :, :]
+        min_anchor, max_anchor = _runtime_aligned_anchor_bounds(
+            token_count,
+            metadata.block_size,
+            _sample_min_anchor(sample),
         )
-        label_tokens = mx.array(
-            sample["tokens"][anchor + 1 : anchor + metadata.block_size][None, :],
-            dtype=mx.uint32,
+        if max_anchor == min_anchor or rng.random() < 0.5:
+            anchor = min_anchor
+        else:
+            anchor = rng.randint(min_anchor + 1, max_anchor)
+        segment_start = (
+            _runtime_aligned_segment_start(sample, metadata, anchor, rng)
+            if supports_split_context_cache
+            else 0
         )
-        anchor_embedding = mx.array(sample["token_embeddings"][anchor])
-        mask_embedding = mx.array(sample["mask_embedding"])
+        window = _runtime_aligned_training_arrays(
+            sample,
+            metadata,
+            anchor,
+            segment_start=segment_start,
+        )
+        cache_context_hidden = mx.array(window["cache_context_hidden"][None, :, :])
+        context_hidden = mx.array(window["context_hidden"][None, :, :])
+        target_hidden = mx.array(window["target_hidden"][None, :, :])
+        label_tokens = mx.array(window["label_tokens"][None, :], dtype=mx.uint32)
+        anchor_embedding = mx.array(window["anchor_embedding"])
+        mask_embedding = mx.array(window["mask_embedding"])
         mask_block = mx.broadcast_to(
             mask_embedding,
             (metadata.block_size - 1, metadata.hidden_size),
@@ -1053,6 +1291,7 @@ def train_omlx_draft_from_cache(
         ]
         loss, grads = value_and_grad(
             draft,
+            cache_context_hidden,
             context_hidden,
             block_embeddings,
             target_hidden,
@@ -1062,6 +1301,11 @@ def train_omlx_draft_from_cache(
         mx.eval(draft.parameters(), optimizer.state, loss)
         progress.set_postfix(loss=f"{float(loss.item()):.5f}")
     draft.save_weights(str(draft_dir / "model.safetensors"))
+    config_path = draft_dir / "config.json"
+    if config_path.exists():
+        config_payload = json.loads(config_path.read_text())
+        config_payload.setdefault("dflasher", {})["training_objective"] = loss_name
+        config_path.write_text(json.dumps(config_payload, indent=2) + "\n")
     manifest = {
         "source_model": metadata.source_model,
         "cache_dir": str(cache_dir),
@@ -1114,6 +1358,7 @@ def build_omlx_draft(options: OmlxBuildOptions) -> Path:
         output_dir=options.output_dir,
         block_size=options.block_size,
         draft_layers=options.draft_layers,
+        intermediate_size=options.intermediate_size,
         layer_policy=options.layer_policy,
         target_layer_ids=options.target_layer_ids,
         mask_token_id=options.mask_token_id,
@@ -1208,6 +1453,120 @@ def greedy_omlx_tokens(model, tokenizer, prompt: str, max_new_tokens: int) -> li
     return tokens
 
 
+def _decode_omlx_tokens(tokenizer, tokens: list[int]) -> str:
+    try:
+        return str(tokenizer.decode(tokens))
+    except TypeError:
+        return "".join(str(tokenizer.decode(int(token))) for token in tokens)
+
+
+def _generate_with_dflash_mlx_runtime(
+    source_model: str,
+    draft_dir: Path,
+    prompt: str,
+    max_new_tokens: int,
+) -> tuple[str, list[int], float]:
+    _ensure_omlx_app_site_packages()
+    try:
+        from dflash_mlx.runtime.bundle import load_runtime_bundle
+        from dflash_mlx.runtime.context import build_offline_runtime_context
+    except ImportError as exc:
+        raise RuntimeError("dflash_mlx generation support is unavailable.") from exc
+
+    runtime_context = build_offline_runtime_context(verify_mode="dflash")
+    bundle = load_runtime_bundle(
+        model_ref=source_model,
+        draft_ref=str(draft_dir),
+        draft_quant="none",
+        verify_config=runtime_context.verify,
+        lazy=True,
+    )
+    return _generate_with_dflash_mlx_bundle(bundle, runtime_context, prompt, max_new_tokens)
+
+
+def _generate_with_dflash_mlx_bundle(
+    bundle,
+    runtime_context,
+    prompt: str,
+    max_new_tokens: int,
+) -> tuple[str, list[int], float]:
+    try:
+        from dflash_mlx.engine.events import SummaryEvent, TokenEvent
+        from dflash_mlx.runtime import get_stop_token_ids, stream_dflash_generate
+    except ImportError as exc:
+        raise RuntimeError("dflash_mlx generation support is unavailable.") from exc
+
+    stream = stream_dflash_generate(
+        target_model=bundle.target_model,
+        target_ops=bundle.target_ops,
+        tokenizer=bundle.tokenizer,
+        draft_model=bundle.draft_model,
+        draft_backend=bundle.draft_backend,
+        prompt=prompt,
+        max_new_tokens=max_new_tokens,
+        use_chat_template=False,
+        stop_token_ids=get_stop_token_ids(bundle.tokenizer),
+        runtime_context=runtime_context,
+    )
+    tokens: list[int] = []
+    summary = None
+    try:
+        for event in stream:
+            if isinstance(event, TokenEvent):
+                tokens.append(int(event.token_id))
+            elif isinstance(event, SummaryEvent):
+                summary = event
+    finally:
+        close = getattr(stream, "close", None)
+        if close is not None:
+            close()
+    acceptance = float(getattr(summary, "acceptance_ratio", 0.0) or 0.0)
+    return _decode_omlx_tokens(bundle.tokenizer, tokens), tokens, acceptance
+
+
+def _greedy_dflash_mlx_tokens(bundle, prompt: str, max_new_tokens: int) -> list[int]:
+    if max_new_tokens < 1:
+        return []
+    try:
+        import mlx.core as mx
+        from dflash_mlx.engine.sampling import greedy_tokens_with_mask, prepare_prompt_tokens
+    except ImportError as exc:
+        raise RuntimeError("dflash_mlx greedy support is unavailable.") from exc
+
+    prompt_tokens = prepare_prompt_tokens(
+        bundle.tokenizer,
+        prompt,
+        use_chat_template=False,
+    )
+    target_cache = bundle.target_ops.make_cache(
+        bundle.target_model,
+        enable_speculative_linear_cache=True,
+    )
+    logits, _captured = bundle.target_ops.verify_block(
+        target_model=bundle.target_model,
+        verify_ids=mx.array(prompt_tokens, dtype=mx.uint32)[None, :],
+        target_cache=target_cache,
+        capture_layer_ids=set(),
+    )
+    token = greedy_tokens_with_mask(logits[:, -1, :], None).reshape(-1)
+    mx.eval(token)
+    tokens = [int(token.item())]
+    stop_ids = set(_eos_token_ids(bundle.tokenizer))
+    for _ in range(max_new_tokens - 1):
+        if tokens[-1] in stop_ids:
+            break
+        logits, _captured = bundle.target_ops.verify_block(
+            target_model=bundle.target_model,
+            verify_ids=token.reshape(1, 1).astype(mx.uint32),
+            target_cache=target_cache,
+            capture_layer_ids=set(),
+        )
+        token = greedy_tokens_with_mask(logits[:, -1, :], None).reshape(-1)
+        mx.eval(token)
+        tokens.append(int(token.item()))
+    return tokens
+
+
 def generate_omlx_dflash(
     source_model: str,
     draft_dir: Path,
@@ -1216,7 +1575,17 @@ def generate_omlx_dflash(
 ) -> tuple[str, list[int], float]:
     source_model = resolve_omlx_source_model(source_model)
     _mx, _nn, _optim, mlx_lm_load, _make_prompt_cache, _make_sampler = _import_mlx()
-    _DFlashConfig, _DFlashDraftModel, stream_generate = _import_dflash_mlx()
+    runtime = _import_dflash_mlx()
+    if runtime.flavor == "dflash_mlx":
+        return _generate_with_dflash_mlx_runtime(
+            source_model,
+            draft_dir,
+            prompt,
+            max_new_tokens,
+        )
+    if runtime.stream_generate is None:
+        raise RuntimeError("DFlash stream_generate is unavailable.")
+    stream_generate = runtime.stream_generate
     model, tokenizer = mlx_lm_load(source_model, lazy=True)
     source_config = read_model_config(source_model)
     _validate_prompt_context(
@@ -1253,7 +1622,58 @@ def evaluate_omlx_dflash(
 ) -> OmlxEvalResult:
     source_model = resolve_omlx_source_model(source_model)
     _mx, _nn, _optim, mlx_lm_load, _make_prompt_cache, _make_sampler = _import_mlx()
-    _DFlashConfig, _DFlashDraftModel, stream_generate = _import_dflash_mlx()
+    runtime = _import_dflash_mlx()
+    if runtime.flavor == "dflash_mlx":
+        _ensure_omlx_app_site_packages()
+        try:
+            from dflash_mlx.runtime.bundle import load_runtime_bundle
+            from dflash_mlx.runtime.context import build_offline_runtime_context
+        except ImportError as exc:
+            raise RuntimeError("dflash_mlx generation support is unavailable.") from exc
+        runtime_context = build_offline_runtime_context(verify_mode="dflash")
+        bundle = load_runtime_bundle(
+            model_ref=source_model,
+            draft_ref=str(draft_dir),
+            draft_quant="none",
+            verify_config=runtime_context.verify,
+            lazy=True,
+        )
+        tokenizer = bundle.tokenizer
+        source_config = read_model_config(source_model)
+        max_context = int(_config_value(source_config, "max_position_embeddings", 2048))
+        exact = 0
+        acceptances: list[float] = []
+        max_prompt_tokens = 0
+        for prompt in prompts:
+            prompt_tokens = _validate_prompt_context(
+                tokenizer,
+                prompt,
+                max_new_tokens,
+                max_context,
+            )
+            max_prompt_tokens = max(max_prompt_tokens, prompt_tokens)
+            expected = _greedy_dflash_mlx_tokens(bundle, prompt, max_new_tokens)
+            _text, actual, acceptance = _generate_with_dflash_mlx_bundle(
+                bundle,
+                runtime_context,
+                prompt,
+                max_new_tokens,
+            )
+            actual = actual[: len(expected)]
+            if actual == expected:
+                exact += 1
+            acceptances.append(acceptance)
+        mean_acceptance = sum(acceptances) / len(acceptances) if acceptances else 0.0
+        return OmlxEvalResult(
+            prompts=len(prompts),
+            exact_matches=exact,
+            mean_acceptance=mean_acceptance,
+            mean_draft_acceptance=mean_acceptance,
+            max_prompt_tokens=max_prompt_tokens,
+        )
+    if runtime.stream_generate is None:
+        raise RuntimeError("DFlash stream_generate is unavailable.")
+    stream_generate = runtime.stream_generate
     model, tokenizer = mlx_lm_load(source_model, lazy=True)
     source_config = read_model_config(source_model)
     max_context = int(_config_value(source_config, "max_position_embeddings", 2048))
@@ -1440,6 +1860,8 @@ def _safe_omlx_model_dir(model_root: Path, installed_name: str) -> Path:
     raw = Path(installed_name)
     if raw.is_absolute() or raw.name != installed_name or installed_name in {".", ".."}:
         raise ValueError("--installed-name must be a single directory name, not a path.")
+    if installed_name in PROTECTED_OMLX_DRAFT_NAMES:
+        raise ValueError(f"Refusing to overwrite protected oMLX draft: {installed_name}")
     target_dir = (model_root / installed_name).resolve(strict=False)
     root = model_root.resolve(strict=False)
     if target_dir != root and root not in target_dir.parents:

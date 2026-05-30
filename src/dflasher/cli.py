@@ -360,6 +360,10 @@ def build(
         int,
         typer.Option(help="OMLX draft mask token id."),
     ] = 0,
+    omlx_intermediate_size: Annotated[
+        int | None,
+        typer.Option(help="OMLX draft FFN intermediate size. Defaults to source config."),
+    ] = None,
     omlx_loss_fn: Annotated[
         str,
         typer.Option(help="OMLX training loss: hidden-mse, ce, or ce-hidden."),
@@ -460,6 +464,7 @@ def build(
                 max_length=max_length,
                 block_size=block_size,
                 draft_layers=draft_layers,
+                intermediate_size=omlx_intermediate_size,
                 layer_policy=layer_policy,
                 target_layer_ids=tuple(target_layer_id) if target_layer_id else None,
                 mask_token_id=omlx_mask_token_id,
@@ -817,6 +822,10 @@ def omlx_init_draft(
     out: Annotated[Path, typer.Option("--out", "-o", help="Output draft directory.")],
     block_size: Annotated[int, typer.Option(help="Draft block size.")] = 8,
     draft_layers: Annotated[int, typer.Option(help="Number of lightweight draft layers.")] = 2,
+    intermediate_size: Annotated[
+        int | None,
+        typer.Option(help="Draft FFN intermediate size. Defaults to source config."),
+    ] = None,
     layer_policy: Annotated[
         str, typer.Option(help="auto, speculators, dflash5, zlab5, zlab6, or zlab-linspace*.")
     ] = "auto",
@@ -834,6 +843,7 @@ def omlx_init_draft(
             output_dir=out,
             block_size=block_size,
             draft_layers=draft_layers,
+            intermediate_size=intermediate_size,
             layer_policy=layer_policy,
             target_layer_ids=tuple(target_layer_id) if target_layer_id else None,
             mask_token_id=mask_token_id,
@@ -901,6 +911,10 @@ def omlx_build(
     max_length: Annotated[int, typer.Option(help="Token truncation length.")] = 128,
     block_size: Annotated[int, typer.Option(help="Draft block size.")] = 8,
     draft_layers: Annotated[int, typer.Option(help="Number of lightweight draft layers.")] = 2,
+    intermediate_size: Annotated[
+        int | None,
+        typer.Option(help="Draft FFN intermediate size. Defaults to source config."),
+    ] = None,
     layer_policy: Annotated[
         str, typer.Option(help="auto, speculators, dflash5, zlab5, zlab6, or zlab-linspace*.")
     ] = "auto",
@@ -942,6 +956,7 @@ def omlx_build(
             max_length=max_length,
             block_size=block_size,
             draft_layers=draft_layers,
+            intermediate_size=intermediate_size,
             layer_policy=layer_policy,
             target_layer_ids=tuple(target_layer_id) if target_layer_id else None,
             mask_token_id=mask_token_id,
