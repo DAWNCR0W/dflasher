@@ -6,6 +6,7 @@ import platform
 import shlex
 import shutil
 import tempfile
+from dataclasses import asdict
 from pathlib import Path
 from typing import Annotated, NoReturn
 
@@ -38,6 +39,18 @@ from dflasher.official import (
     validate_vllm_equivalence,
     write_pipeline_script,
 )
+from dflasher.omlx import (
+    OmlxBuildOptions,
+    OmlxCacheMetadata,
+    build_omlx_draft,
+    evaluate_omlx_dflash,
+    extract_omlx_hidden_cache,
+    generate_omlx_dflash,
+    init_omlx_draft,
+    make_omlx_draft_config,
+    read_model_config,
+    train_omlx_draft_from_cache,
+)
 from dflasher.speculators_bridge import SpeculatorsRecipe, render_speculators_script
 from dflasher.training import TrainOptions
 from dflasher.training import train as train_draft
@@ -47,9 +60,11 @@ app = typer.Typer(help="Train and test DFlash-style draft models for Hugging Fac
 official_app = typer.Typer(help="Run the official vLLM Speculators DFlash pipeline.")
 mac_app = typer.Typer(help="Run Mac-friendly DFlash-lite and z-lab MLX workflows.")
 zlab_app = typer.Typer(help="Inspect and serve known z-lab DFlash draft models.")
+omlx_app = typer.Typer(help="Build and run local OMLX/MLX DFlash drafts.")
 app.add_typer(official_app, name="official")
 app.add_typer(mac_app, name="mac")
 app.add_typer(zlab_app, name="zlab")
+app.add_typer(omlx_app, name="omlx")
 console = Console()
 
 
@@ -173,7 +188,7 @@ def _resolve_build_backend(backend: str, device: str) -> str:
     normalized = backend.lower()
     if normalized == "official":
         return "cuda"
-    if normalized in {"lite", "mac", "mac-lite", "cuda"}:
+    if normalized in {"lite", "mac", "mac-lite", "cuda", "mlx", "omlx"}:
         return "mac-lite" if normalized == "mac" else normalized
     if normalized != "auto":
         return normalized
@@ -328,6 +343,18 @@ def build(
         list[str] | None,
         typer.Option("--prepare-arg", help="Repeatable extra arg passed to prepare_data.py."),
     ] = None,
+    omlx_cache_dir: Annotated[
+        Path | None,
+        typer.Option(help="OMLX hidden-state cache directory for --backend omlx/mlx."),
+    ] = None,
+    omlx_max_samples: Annotated[
+        int,
+        typer.Option(help="OMLX cache sample count for --backend omlx/mlx."),
+    ] = 8,
+    omlx_mask_token_id: Annotated[
+        int,
+        typer.Option(help="OMLX draft mask token id."),
+    ] = 0,
 ):
     """Build a draft model from a source model.
 
@@ -335,8 +362,10 @@ def build(
     a vLLM Speculators DFlash checkpoint and requires a CUDA/vLLM environment.
     """
     resolved_backend = _resolve_build_backend(backend, device)
-    if resolved_backend not in {"lite", "mac-lite", "cuda"}:
-        raise typer.BadParameter("backend must be auto, lite, mac-lite, mac, cuda, or official")
+    if resolved_backend not in {"lite", "mac-lite", "cuda", "mlx", "omlx"}:
+        raise typer.BadParameter(
+            "backend must be auto, lite, mac-lite, mac, cuda, official, mlx, or omlx"
+        )
     try:
         if not plan_only:
             _ensure_output_available(out, overwrite=overwrite)
@@ -400,6 +429,38 @@ def build(
         )
         if result.exact_matches != result.prompts:
             raise typer.Exit(code=1)
+        return
+
+    if resolved_backend in {"mlx", "omlx"}:
+        try:
+            options = OmlxBuildOptions(
+                source_model=source_model,
+                output_dir=out,
+                texts_file=texts_file,
+                dataset_name=dataset,
+                dataset_split=dataset_split,
+                text_column=text_column,
+                data_limit=data_limit,
+                allow_builtin_data=allow_builtin_data,
+                cache_dir=omlx_cache_dir,
+                max_samples=omlx_max_samples,
+                max_length=max_length,
+                block_size=block_size,
+                draft_layers=draft_layers,
+                layer_policy=layer_policy,
+                target_layer_ids=tuple(target_layer_id) if target_layer_id else None,
+                mask_token_id=omlx_mask_token_id,
+                max_steps=max_steps,
+                learning_rate=learning_rate,
+                seed=seed,
+                overwrite=overwrite,
+                train=not plan_only,
+            )
+            draft_dir = build_omlx_draft(options)
+        except (RuntimeError, ValueError) as exc:
+            console.print(f"[red]{exc}[/red]")
+            raise typer.Exit(code=1) from exc
+        console.print(f"[green]Built OMLX DFlash draft[/green] {draft_dir}")
         return
 
     official_workspace = workspace or out.parent / f"{out.name}.official-workspace"
@@ -636,6 +697,292 @@ def compare(
     console.print(f"mean acceptance: {stats.mean_acceptance:.2f}")
     if baseline.tolist() != speculative.tolist():
         raise typer.Exit(code=1)
+
+
+def _read_prompt_lines(prompts_file: Path | None, fallback: str) -> list[str]:
+    if prompts_file is None:
+        return [fallback]
+    prompts = [line.strip() for line in prompts_file.read_text().splitlines() if line.strip()]
+    if not prompts:
+        raise ValueError(f"No prompts found in {prompts_file}")
+    return prompts
+
+
+@omlx_app.command("inspect")
+def omlx_inspect(
+    source_model: Annotated[str, typer.Argument(help="Local OMLX/MLX source model directory.")],
+    layer_policy: Annotated[
+        str, typer.Option(help="auto, speculators, dflash5, zlab5, zlab6, or zlab-linspace*.")
+    ] = "auto",
+    target_layer_id: Annotated[
+        list[int] | None,
+        typer.Option("--target-layer-id", help="Repeatable explicit target hidden layer id."),
+    ] = None,
+):
+    """Inspect a local OMLX/MLX source model without loading weights."""
+    try:
+        cfg = read_model_config(source_model)
+        draft_cfg = make_omlx_draft_config(
+            source_model=source_model,
+            block_size=8,
+            draft_layers=2,
+            layer_policy=layer_policy,
+            target_layer_ids=tuple(target_layer_id) if target_layer_id else None,
+        )
+    except ValueError as exc:
+        _exit_invalid_config(exc)
+    table = Table(title=source_model)
+    table.add_column("field")
+    table.add_column("value")
+    table.add_row("model_type", str(cfg.get("model_type")))
+    table.add_row("architectures", ", ".join(cfg.get("architectures", [])))
+    table.add_row("hidden_size", str(draft_cfg.hidden_size))
+    table.add_row("num_target_layers", str(draft_cfg.num_target_layers))
+    table.add_row("vocab_size", str(draft_cfg.vocab_size))
+    table.add_row("selected_layer_ids", " ".join(map(str, draft_cfg.target_layer_ids)))
+    table.add_row("quantization", "yes" if cfg.get("quantization") else "no")
+    table.add_row("draft_format", draft_cfg.draft_format)
+    console.print(table)
+
+
+@omlx_app.command("extract-cache")
+def omlx_extract_cache(
+    source_model: Annotated[str, typer.Argument(help="Local OMLX/MLX source model directory.")],
+    out: Annotated[Path, typer.Option("--out", "-o", help="Output hidden-state cache dir.")],
+    texts_file: Annotated[
+        str | None, typer.Option(help="Local newline-delimited training text file.")
+    ] = None,
+    dataset: Annotated[str | None, typer.Option(help="Optional Hugging Face dataset name.")] = None,
+    dataset_split: Annotated[str, typer.Option(help="Dataset split.")] = "train",
+    text_column: Annotated[str, typer.Option(help="Dataset text column.")] = "text",
+    data_limit: Annotated[int | None, typer.Option(help="Maximum rows to load.")] = None,
+    allow_builtin_data: Annotated[
+        bool, typer.Option(help="Allow tiny bundled data for smoke/debug extraction.")
+    ] = False,
+    max_samples: Annotated[int, typer.Option(help="Maximum cache samples.")] = 8,
+    max_length: Annotated[int, typer.Option(help="Token truncation length.")] = 128,
+    block_size: Annotated[int, typer.Option(help="Draft block size.")] = 8,
+    layer_policy: Annotated[
+        str, typer.Option(help="auto, speculators, dflash5, zlab5, zlab6, or zlab-linspace*.")
+    ] = "auto",
+    target_layer_id: Annotated[
+        list[int] | None,
+        typer.Option("--target-layer-id", help="Repeatable explicit target hidden layer id."),
+    ] = None,
+    mask_token_id: Annotated[int, typer.Option(help="Draft mask token id.")] = 0,
+    overwrite: Annotated[bool, typer.Option(help="Replace existing cache dir.")] = False,
+):
+    """Extract selected hidden states from a local MLX source model into a cache."""
+    try:
+        extract_omlx_hidden_cache(
+            source_model=source_model,
+            cache_dir=out,
+            texts_file=texts_file,
+            dataset_name=dataset,
+            dataset_split=dataset_split,
+            text_column=text_column,
+            data_limit=data_limit,
+            allow_builtin_data=allow_builtin_data,
+            max_samples=max_samples,
+            max_length=max_length,
+            block_size=block_size,
+            layer_policy=layer_policy,
+            target_layer_ids=tuple(target_layer_id) if target_layer_id else None,
+            mask_token_id=mask_token_id,
+            overwrite=overwrite,
+        )
+    except (RuntimeError, ValueError) as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1) from exc
+
+
+@omlx_app.command("init-draft")
+def omlx_init_draft(
+    source_model: Annotated[str, typer.Argument(help="Local OMLX/MLX source model directory.")],
+    out: Annotated[Path, typer.Option("--out", "-o", help="Output draft directory.")],
+    block_size: Annotated[int, typer.Option(help="Draft block size.")] = 8,
+    draft_layers: Annotated[int, typer.Option(help="Number of lightweight draft layers.")] = 2,
+    layer_policy: Annotated[
+        str, typer.Option(help="auto, speculators, dflash5, zlab5, zlab6, or zlab-linspace*.")
+    ] = "auto",
+    target_layer_id: Annotated[
+        list[int] | None,
+        typer.Option("--target-layer-id", help="Repeatable explicit target hidden layer id."),
+    ] = None,
+    mask_token_id: Annotated[int, typer.Option(help="Draft mask token id.")] = 0,
+    overwrite: Annotated[bool, typer.Option(help="Replace existing draft dir.")] = False,
+):
+    """Create a local MLX DFlash draft checkpoint skeleton for the source model."""
+    try:
+        init_omlx_draft(
+            source_model=source_model,
+            output_dir=out,
+            block_size=block_size,
+            draft_layers=draft_layers,
+            layer_policy=layer_policy,
+            target_layer_ids=tuple(target_layer_id) if target_layer_id else None,
+            mask_token_id=mask_token_id,
+            overwrite=overwrite,
+        )
+    except (RuntimeError, ValueError) as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1) from exc
+    console.print(f"[green]Initialized OMLX DFlash draft[/green] {out}")
+
+
+@omlx_app.command("train")
+def omlx_train(
+    cache_dir: Annotated[Path, typer.Argument(help="Hidden-state cache directory.")],
+    draft_dir: Annotated[Path, typer.Argument(help="OMLX DFlash draft directory.")],
+    max_steps: Annotated[int, typer.Option(help="Training optimizer steps.")] = 20,
+    learning_rate: Annotated[float, typer.Option(help="AdamW learning rate.")] = 1e-4,
+    seed: Annotated[int, typer.Option(help="Random seed.")] = 13,
+):
+    """Train the OMLX draft from an extracted hidden-state cache."""
+    try:
+        train_omlx_draft_from_cache(
+            cache_dir=cache_dir,
+            draft_dir=draft_dir,
+            max_steps=max_steps,
+            learning_rate=learning_rate,
+            seed=seed,
+        )
+    except (RuntimeError, ValueError) as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1) from exc
+
+
+@omlx_app.command("build")
+def omlx_build(
+    source_model: Annotated[str, typer.Argument(help="Local OMLX/MLX source model directory.")],
+    out: Annotated[Path, typer.Option("--out", "-o", help="Output draft directory.")],
+    texts_file: Annotated[
+        str | None, typer.Option(help="Local newline-delimited training text file.")
+    ] = None,
+    dataset: Annotated[str | None, typer.Option(help="Optional Hugging Face dataset name.")] = None,
+    dataset_split: Annotated[str, typer.Option(help="Dataset split.")] = "train",
+    text_column: Annotated[str, typer.Option(help="Dataset text column.")] = "text",
+    data_limit: Annotated[int | None, typer.Option(help="Maximum rows to load.")] = None,
+    allow_builtin_data: Annotated[
+        bool, typer.Option(help="Allow tiny bundled data for smoke/debug builds.")
+    ] = False,
+    cache_dir: Annotated[Path | None, typer.Option(help="Hidden-state cache dir.")] = None,
+    max_samples: Annotated[int, typer.Option(help="Maximum cache samples.")] = 8,
+    max_length: Annotated[int, typer.Option(help="Token truncation length.")] = 128,
+    block_size: Annotated[int, typer.Option(help="Draft block size.")] = 8,
+    draft_layers: Annotated[int, typer.Option(help="Number of lightweight draft layers.")] = 2,
+    layer_policy: Annotated[
+        str, typer.Option(help="auto, speculators, dflash5, zlab5, zlab6, or zlab-linspace*.")
+    ] = "auto",
+    target_layer_id: Annotated[
+        list[int] | None,
+        typer.Option("--target-layer-id", help="Repeatable explicit target hidden layer id."),
+    ] = None,
+    mask_token_id: Annotated[int, typer.Option(help="Draft mask token id.")] = 0,
+    max_steps: Annotated[int, typer.Option(help="Training optimizer steps.")] = 20,
+    learning_rate: Annotated[float, typer.Option(help="AdamW learning rate.")] = 1e-4,
+    seed: Annotated[int, typer.Option(help="Random seed.")] = 13,
+    overwrite: Annotated[bool, typer.Option(help="Replace existing outputs.")] = False,
+    skip_train: Annotated[
+        bool,
+        typer.Option(help="Initialize and cache but skip draft training."),
+    ] = False,
+):
+    """Build a local MLX DFlash draft from an OMLX/MLX source model."""
+    try:
+        options = OmlxBuildOptions(
+            source_model=source_model,
+            output_dir=out,
+            texts_file=texts_file,
+            dataset_name=dataset,
+            dataset_split=dataset_split,
+            text_column=text_column,
+            data_limit=data_limit,
+            allow_builtin_data=allow_builtin_data,
+            cache_dir=cache_dir,
+            max_samples=max_samples,
+            max_length=max_length,
+            block_size=block_size,
+            draft_layers=draft_layers,
+            layer_policy=layer_policy,
+            target_layer_ids=tuple(target_layer_id) if target_layer_id else None,
+            mask_token_id=mask_token_id,
+            max_steps=max_steps,
+            learning_rate=learning_rate,
+            seed=seed,
+            overwrite=overwrite,
+            train=not skip_train,
+        )
+        draft_dir = build_omlx_draft(options)
+    except (RuntimeError, ValueError) as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1) from exc
+    console.print(f"[green]Built OMLX DFlash draft[/green] {draft_dir}")
+
+
+@omlx_app.command("generate")
+def omlx_generate(
+    source_model: Annotated[str, typer.Argument(help="Local OMLX/MLX source model directory.")],
+    draft_dir: Annotated[Path, typer.Argument(help="OMLX DFlash draft directory.")],
+    prompt: Annotated[str, typer.Option("--prompt", "-p", help="Prompt text.")],
+    max_new_tokens: Annotated[int, typer.Option(help="Maximum new tokens.")] = 64,
+):
+    """Generate with an OMLX source model and local MLX DFlash draft."""
+    try:
+        text, _tokens, mean_acceptance = generate_omlx_dflash(
+            source_model=source_model,
+            draft_dir=draft_dir,
+            prompt=prompt,
+            max_new_tokens=max_new_tokens,
+        )
+    except (RuntimeError, ValueError) as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1) from exc
+    console.print(text)
+    console.print(f"[dim]mean acceptance={mean_acceptance:.2f}[/dim]")
+
+
+@omlx_app.command("eval")
+def omlx_eval(
+    source_model: Annotated[str, typer.Argument(help="Local OMLX/MLX source model directory.")],
+    draft_dir: Annotated[Path, typer.Argument(help="OMLX DFlash draft directory.")],
+    prompts_file: Annotated[Path | None, typer.Option(help="Newline-delimited prompts.")] = None,
+    prompt: Annotated[str, typer.Option(help="Fallback prompt when --prompts-file is omitted.")] = (
+        "Explain speculative decoding in one sentence."
+    ),
+    max_new_tokens: Annotated[int, typer.Option(help="Maximum new tokens.")] = 32,
+):
+    """Check that OMLX DFlash output matches target greedy tokens at temperature 0."""
+    try:
+        prompts = _read_prompt_lines(prompts_file, prompt)
+        result = evaluate_omlx_dflash(
+            source_model=source_model,
+            draft_dir=draft_dir,
+            prompts=prompts,
+            max_new_tokens=max_new_tokens,
+        )
+    except (RuntimeError, ValueError) as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1) from exc
+    console.print(
+        f"Exact matches: {result.exact_matches}/{result.prompts}; "
+        f"mean acceptance: {result.mean_acceptance:.2f}"
+    )
+    if result.exact_matches != result.prompts:
+        raise typer.Exit(code=1)
+
+
+@omlx_app.command("cache-info")
+def omlx_cache_info(
+    cache_dir: Annotated[Path, typer.Argument(help="Hidden-state cache directory.")],
+):
+    """Print OMLX hidden-state cache metadata."""
+    try:
+        metadata = OmlxCacheMetadata.load(cache_dir)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1) from exc
+    console.print_json(data=asdict(metadata))
 
 
 @app.command("speculators-script")

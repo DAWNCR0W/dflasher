@@ -29,6 +29,10 @@ The project has four practical paths:
   useful for correctness experiments.
 - `dflasher mac`: Mac-friendly wrappers around the local PyTorch/MPS trainer,
   plus z-lab MLX script generation for Apple Silicon inference.
+- `dflasher omlx`: a local OMLX/MLX backend for quantized Apple Silicon models.
+  It extracts selected target hidden states, writes a reusable cache, trains a
+  lightweight MLX DFlash draft from that cache, and verifies generation against
+  the OMLX target model.
 - `dflasher official`: an orchestration layer for the public vLLM Speculators
   DFlash pipeline. This is the path that produces vLLM/Speculators checkpoints
   with `config.json` and `model.safetensors`.
@@ -60,6 +64,13 @@ the z-lab package:
 
 ```bash
 pip install -e ".[zlab-mlx]"
+```
+
+The local OMLX backend needs the Mac dependencies and the z-lab MLX draft
+runtime:
+
+```bash
+pip install -e ".[dev,mac,zlab-mlx]"
 ```
 
 For actual vLLM serving/training on Linux/CUDA, install the vLLM extra in that
@@ -176,6 +187,63 @@ dflasher build sshleifer/tiny-gpt2 \
   --device mps \
   --max-steps 30
 ```
+
+## Local OMLX / MLX DFlash drafts
+
+Use this path for local Apple Silicon models stored under directories such as
+`~/.omlx/models/...`. It is designed for MLX-compatible quantized source models,
+including MiniMaxM2-style local checkpoints.
+
+Inspect a local source model without loading all weights:
+
+```bash
+dflasher omlx inspect ~/.omlx/models/MiniMax-M2.7-BF16-ultra-uncensored-heretic-oQ4
+```
+
+Build a local MLX DFlash draft:
+
+```bash
+dflasher omlx build ~/.omlx/models/MiniMax-M2.7-BF16-ultra-uncensored-heretic-oQ4 \
+  --texts-file examples/train_texts.txt \
+  --out ./runs/minimax-m27-oq4-dflash \
+  --cache-dir ./runs/minimax-m27-oq4-cache \
+  --max-samples 4 \
+  --max-length 64 \
+  --block-size 8 \
+  --draft-layers 2 \
+  --max-steps 20 \
+  --overwrite
+```
+
+The same backend is also available through the product entry point:
+
+```bash
+dflasher build ~/.omlx/models/MiniMax-M2.7-BF16-ultra-uncensored-heretic-oQ4 \
+  --backend omlx \
+  --texts-file examples/train_texts.txt \
+  --out ./runs/minimax-m27-oq4-dflash \
+  --omlx-cache-dir ./runs/minimax-m27-oq4-cache \
+  --omlx-max-samples 4 \
+  --max-length 64 \
+  --block-size 8 \
+  --draft-layers 2 \
+  --max-steps 20 \
+  --overwrite
+```
+
+Verify target-equivalent greedy decoding with the local OMLX verifier:
+
+```bash
+dflasher omlx eval ~/.omlx/models/MiniMax-M2.7-BF16-ultra-uncensored-heretic-oQ4 \
+  ./runs/minimax-m27-oq4-dflash \
+  --prompt "Explain speculative decoding in one sentence." \
+  --max-new-tokens 16
+```
+
+This backend is intentionally explicit: cache extraction loads the source model,
+draft training reads the cache, and evaluation loads the OMLX source model again
+as the verifier. Large quantized MoE models can still require substantial RAM and
+time even when the draft itself is small.
 
 For z-lab public DFlash checkpoints on Apple Silicon, generate a small MLX script:
 
