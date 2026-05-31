@@ -65,7 +65,117 @@ import mlx.core as mx
 from mlx_lm.models import cache as cache_mod
 from mlx_lm.models.base import create_attention_mask
 
+from dflash_mlx.engine.target_qwen_gdn import (
+    _HYBRID_SDPA_EXACT_KV_THRESHOLD,
+    _TREE_POSITIONS_ATTR,
+    _apply_rope_positions,
+    _clear_tree_cache_context,
+    _commit_kv_tree_path,
+    _gqa_reshape_sdpa,
+    _set_tree_cache_context,
+)
 from dflash_mlx.engine.target_ops import TargetCapabilities
+
+
+def _minimax_project_qkv(attn: Any, x: mx.array) -> tuple[mx.array, mx.array, mx.array]:
+    batch_size, seq_len, _ = x.shape
+    queries = attn.q_proj(x)
+    keys = attn.k_proj(x)
+    values = attn.v_proj(x)
+    if getattr(attn, "use_qk_norm", False):
+        queries = attn.q_norm(queries)
+        keys = attn.k_norm(keys)
+    queries = queries.reshape(batch_size, seq_len, attn.num_attention_heads, -1).transpose(
+        0, 2, 1, 3
+    )
+    keys = keys.reshape(batch_size, seq_len, attn.num_key_value_heads, -1).transpose(
+        0, 2, 1, 3
+    )
+    values = values.reshape(batch_size, seq_len, attn.num_key_value_heads, -1).transpose(
+        0, 2, 1, 3
+    )
+    return queries, keys, values
+
+
+def _minimax_tree_attention_call(
+    attn: Any,
+    x: mx.array,
+    *,
+    mask: Optional[mx.array],
+    cache: Any,
+) -> Optional[mx.array]:
+    if cache is None or not hasattr(cache, _TREE_POSITIONS_ATTR):
+        return None
+    batch_size, seq_len, _ = x.shape
+    queries, keys, values = _minimax_project_qkv(attn, x)
+    positions = getattr(cache, _TREE_POSITIONS_ATTR)
+    queries = _apply_rope_positions(attn.rope, queries, positions)
+    keys = _apply_rope_positions(attn.rope, keys, positions)
+    keys, values = cache.update_and_fetch(keys, values)
+    tree_mask = getattr(cache, "_dflash_tree_attention_mask", mask)
+    output = _gqa_reshape_sdpa(
+        queries,
+        keys,
+        values,
+        cache=cache,
+        scale=attn.scale,
+        mask=tree_mask,
+    )
+    output = output.transpose(0, 2, 1, 3).reshape(batch_size, seq_len, -1)
+    return attn.o_proj(output)
+
+
+def _install_minimax_attention_hook(attn: Any) -> None:
+    cls = type(attn)
+    if getattr(cls, "_dflasher_minimax_attention_hook_installed", False):
+        return
+
+    original_call = cls.__call__
+
+    def attention_call(
+        self,
+        x: mx.array,
+        mask: Optional[mx.array] = None,
+        cache: Optional[Any] = None,
+    ) -> mx.array:
+        tree_output = _minimax_tree_attention_call(self, x, mask=mask, cache=cache)
+        if tree_output is not None:
+            return tree_output
+        cached_prefix_len = int(getattr(cache, "offset", 0) or 0) if cache is not None else 0
+        can_route_gqa = (
+            cache is not None
+            and not isinstance(cache, cache_mod.QuantizedKVCache)
+            and cached_prefix_len >= _HYBRID_SDPA_EXACT_KV_THRESHOLD
+            and (mask is None or isinstance(mask, mx.array) or mask == "causal")
+            and 0 < int(x.shape[1]) <= 16
+        )
+        if not can_route_gqa:
+            return original_call(self, x, mask=mask, cache=cache)
+        batch_size, seq_len, _ = x.shape
+        queries, keys, values = _minimax_project_qkv(self, x)
+        can_use_gqa_fast_path = (
+            queries.dtype in (mx.bfloat16, mx.float16)
+            and int(queries.shape[-1]) in (128, 256)
+            and int(values.shape[-1]) in (128, 256)
+        )
+        if not can_use_gqa_fast_path:
+            return original_call(self, x, mask=mask, cache=cache)
+        queries = self.rope(queries, offset=cached_prefix_len)
+        keys = self.rope(keys, offset=cached_prefix_len)
+        keys, values = cache.update_and_fetch(keys, values)
+        output = _gqa_reshape_sdpa(
+            queries,
+            keys,
+            values,
+            cache=cache,
+            scale=self.scale,
+            mask=mask,
+        )
+        output = output.transpose(0, 2, 1, 3).reshape(batch_size, seq_len, -1)
+        return self.o_proj(output)
+
+    cls.__call__ = attention_call
+    cls._dflasher_minimax_attention_hook_installed = True
 
 
 class MiniMaxM2TargetOps:
@@ -124,13 +234,18 @@ class MiniMaxM2TargetOps:
             supports_rotating_cache_snapshot=False,
             supports_shared_kv=False,
             supports_target_hidden_capture=True,
-            supports_verify_linear=False,
-            supports_tree_verify=False,
+            supports_verify_linear=True,
+            supports_tree_verify=True,
         )
 
     def supports_tree_cache(self, cache_entries: list[Any]) -> bool:
-        del cache_entries
-        return False
+        return all(
+            not isinstance(
+                cache_entry,
+                (cache_mod.QuantizedKVCache, cache_mod.RotatingKVCache),
+            )
+            for cache_entry in cache_entries
+        )
 
     def extract_context_feature(
         self,
@@ -205,8 +320,22 @@ class MiniMaxM2TargetOps:
         target_cache: list[Any],
         capture_layer_ids: Optional[set[int]] = None,
     ) -> tuple[mx.array, list[mx.array] | dict[int, mx.array]]:
-        del target_model, tree_inputs, target_cache, capture_layer_ids
-        raise NotImplementedError("MiniMax-M2 DFlash target ops do not support tree verify.")
+        tree_size = int(tree_inputs.token_ids.shape[0])
+        if tree_size <= 0:
+            raise ValueError("DDTree target tree must contain at least the root slot")
+        self.install_speculative_hooks(target_model)
+        _set_tree_cache_context(target_cache, tree_inputs)
+        try:
+            return self.forward_with_hidden_capture(
+                target_model,
+                input_ids=tree_inputs.token_ids[None],
+                cache=target_cache,
+                capture_layer_ids=capture_layer_ids,
+            )
+        except Exception as exc:
+            for cache_entry in target_cache:
+                _clear_tree_cache_context(cache_entry)
+            raise RuntimeError("MiniMax-M2 DDTree target-tree verify failed") from exc
 
     def restore_after_tree_acceptance(
         self,
@@ -214,11 +343,27 @@ class MiniMaxM2TargetOps:
         *,
         accepted_tree_indices: list[int],
     ) -> int:
-        del cache_entries, accepted_tree_indices
-        raise NotImplementedError("MiniMax-M2 DFlash target ops do not support tree verify.")
+        if not accepted_tree_indices:
+            raise ValueError("accepted_tree_indices must not be empty")
+        replay_start_ns = time.perf_counter_ns()
+        for cache_entry in cache_entries:
+            if hasattr(cache_entry, "keys") and hasattr(cache_entry, "values"):
+                _commit_kv_tree_path(cache_entry, accepted_tree_indices)
+            else:
+                _clear_tree_cache_context(cache_entry)
+                raise NotImplementedError(
+                    f"DDTree cache commit unsupported for {type(cache_entry).__name__}"
+                )
+        return time.perf_counter_ns() - replay_start_ns
 
     def install_speculative_hooks(self, target_model: Any) -> None:
-        self.text_model(target_model)._dflash_speculative_hooks_installed = True
+        text_model = self.text_model(target_model)
+        if getattr(text_model, "_dflash_speculative_hooks_installed", False):
+            return
+        for layer in text_model.layers:
+            if hasattr(layer, "self_attn"):
+                _install_minimax_attention_hook(layer.self_attn)
+        text_model._dflash_speculative_hooks_installed = True
 
     def make_cache(
         self,
@@ -447,6 +592,8 @@ class OmlxAppPatchResult:
     target_ops_path: Path
     target_backend_path: Path
     dflash_engine_path: Path
+    model_settings_path: Path
+    dflash_lifecycle_path: Path
     changed_paths: tuple[Path, ...]
 
 
@@ -1718,7 +1865,9 @@ def evaluate_omlx_dflash(
     )
 
 
-def _resolve_omlx_app_patch_paths(app_path: str | Path) -> tuple[Path, Path, Path]:
+def _resolve_omlx_app_patch_paths(
+    app_path: str | Path,
+) -> tuple[Path, Path, Path, Path, Path]:
     app = Path(app_path).expanduser()
     contents = app / "Contents"
     if not contents.exists():
@@ -1730,8 +1879,21 @@ def _resolve_omlx_app_patch_paths(app_path: str | Path) -> tuple[Path, Path, Pat
         target_ops_path = site_package / "dflash_mlx" / "engine" / "target_ops.py"
         target_backend_path = site_package / "dflash_mlx" / "engine" / "target_minimax_m2.py"
         dflash_engine_path = contents / "Resources" / "omlx" / "engine" / "dflash.py"
-        if target_ops_path.exists() and dflash_engine_path.exists():
-            return target_ops_path, target_backend_path, dflash_engine_path
+        model_settings_path = contents / "Resources" / "omlx" / "model_settings.py"
+        dflash_lifecycle_path = contents / "Resources" / "omlx" / "patches" / "dflash_lifecycle.py"
+        if (
+            target_ops_path.exists()
+            and dflash_engine_path.exists()
+            and model_settings_path.exists()
+            and dflash_lifecycle_path.exists()
+        ):
+            return (
+                target_ops_path,
+                target_backend_path,
+                dflash_engine_path,
+                model_settings_path,
+                dflash_lifecycle_path,
+            )
     raise ValueError(
         "Could not find dflash_mlx/omlx engine files inside the oMLX app bundle: "
         f"{app}"
@@ -1770,7 +1932,129 @@ def _patch_omlx_dflash_text(text: str) -> str:
     )
     if "is_minimax_m2" not in patched:
         raise ValueError("Could not patch oMLX dflash.py for MiniMax-M2.")
+    verify_mode_block = """        self._verify_mode = (
+            getattr(model_settings, "dflash_verify_mode", None)
+            if model_settings
+            else None
+        )
+"""
+    verify_len_cap_block = """        self._verify_len_cap = (
+            getattr(model_settings, "dflash_verify_len_cap", None)
+            if model_settings
+            else None
+        )
+"""
+    block_tokens_block = """        self._block_tokens = (
+            getattr(model_settings, "dflash_block_tokens", None)
+            if model_settings
+            else None
+        )
+"""
+    if 'getattr(model_settings, "dflash_verify_len_cap", None)' not in patched:
+        if verify_mode_block not in patched:
+            raise ValueError("Could not patch oMLX dflash.py: verify mode block not found.")
+        patched = patched.replace(verify_mode_block, verify_mode_block + verify_len_cap_block, 1)
+    if 'getattr(model_settings, "dflash_block_tokens", None)' not in patched:
+        if verify_len_cap_block in patched:
+            patched = patched.replace(
+                verify_len_cap_block,
+                verify_len_cap_block + block_tokens_block,
+                1,
+            )
+        elif verify_mode_block in patched:
+            patched = patched.replace(verify_mode_block, verify_mode_block + block_tokens_block, 1)
+        else:
+            raise ValueError("Could not patch oMLX dflash.py: block token anchor not found.")
+    if "verify_len_cap=self._verify_len_cap" not in patched:
+        patched = patched.replace(
+            "            verify_mode=self._verify_mode,\n",
+            "            verify_mode=self._verify_mode,\n"
+            "            verify_len_cap=self._verify_len_cap,\n",
+            1,
+        )
+    if "block_tokens=self._block_tokens" not in patched:
+        patched = patched.replace(
+            "            publish_generation_snapshot=prefix_flow.publish_generation_snapshot,\n"
+            "            runtime_context=self._runtime_context,\n",
+            "            publish_generation_snapshot=prefix_flow.publish_generation_snapshot,\n"
+            "            block_tokens=self._block_tokens,\n"
+            "            runtime_context=self._runtime_context,\n",
+            1,
+        )
+    if (
+        'getattr(model_settings, "dflash_verify_len_cap", None)' not in patched
+        or 'getattr(model_settings, "dflash_block_tokens", None)' not in patched
+        or "verify_len_cap=self._verify_len_cap" not in patched
+        or "block_tokens=self._block_tokens" not in patched
+    ):
+        raise ValueError("Could not patch oMLX dflash.py runtime knobs.")
     return patched
+
+
+def _patch_omlx_model_settings_text(text: str) -> str:
+    patched = text
+    doc_marker = (
+        "        dflash_draft_sink_size: Attention-sink tokens always kept regardless "
+        "of window\n"
+        "            (None = dflash default 64).\n"
+    )
+    doc_insert = doc_marker + (
+        "        dflash_verify_len_cap: Max target tokens verified per DFlash cycle\n"
+        "            (None = dflash default, equal to block size).\n"
+        "        dflash_block_tokens: Max DFlash block tokens requested at runtime\n"
+        "            (None = draft checkpoint block size).\n"
+    )
+    if "dflash_verify_len_cap:" not in patched:
+        if doc_marker not in patched:
+            raise ValueError("Could not patch oMLX model_settings.py docs.")
+        patched = patched.replace(doc_marker, doc_insert, 1)
+    field_marker = """    dflash_draft_window_size: Optional[int] = None
+    dflash_draft_sink_size: Optional[int] = None
+    dflash_verify_mode: Optional[str] = None  # "dflash" | "adaptive" | "ddtree" | "off"
+"""
+    field_insert = """    dflash_draft_window_size: Optional[int] = None
+    dflash_draft_sink_size: Optional[int] = None
+    dflash_verify_len_cap: Optional[int] = None
+    dflash_block_tokens: Optional[int] = None
+    dflash_verify_mode: Optional[str] = None  # "dflash" | "adaptive" | "ddtree" | "off"
+"""
+    if "dflash_block_tokens: Optional[int]" not in patched:
+        if field_marker not in patched:
+            raise ValueError("Could not patch oMLX model_settings.py fields.")
+        patched = patched.replace(field_marker, field_insert, 1)
+    return patched
+
+
+def _patch_omlx_dflash_lifecycle_text(text: str) -> str:
+    if "target_minimax_m2" in text and "_dflasher_minimax_attention_hook_installed" in text:
+        return text
+    marker = """    try:
+        from dflash_mlx.engine import target_gemma4 as _gemma4
+    except ImportError:
+        logger.debug("dflash_mlx.engine.target_gemma4 not importable")
+    else:
+        wrapped_any |= _wrap_installer(
+            _gemma4,
+            "_install_full_attention_gqa_hook",
+            "_dflash_full_attention_gqa_installed",
+        )
+
+"""
+    insert = marker + """    try:
+        from dflash_mlx.engine import target_minimax_m2 as _minimax_m2
+    except ImportError:
+        logger.debug("dflash_mlx.engine.target_minimax_m2 not importable")
+    else:
+        wrapped_any |= _wrap_installer(
+            _minimax_m2,
+            "_install_minimax_attention_hook",
+            "_dflasher_minimax_attention_hook_installed",
+        )
+
+"""
+    if marker not in text:
+        raise ValueError("Could not patch oMLX dflash_lifecycle.py.")
+    return text.replace(marker, insert, 1)
 
 
 def _write_text_with_backup(path: Path, text: str) -> None:
@@ -1788,9 +2072,13 @@ def patch_omlx_app_for_minimax(
     overwrite_target_backend: bool = False,
     dry_run: bool = False,
 ) -> OmlxAppPatchResult:
-    target_ops_path, target_backend_path, dflash_engine_path = _resolve_omlx_app_patch_paths(
-        app_path
-    )
+    (
+        target_ops_path,
+        target_backend_path,
+        dflash_engine_path,
+        model_settings_path,
+        dflash_lifecycle_path,
+    ) = _resolve_omlx_app_patch_paths(app_path)
     changed: list[Path] = []
     originals: dict[Path, str | None] = {}
 
@@ -1813,6 +2101,16 @@ def patch_omlx_app_for_minimax(
     if patched_dflash_engine != dflash_engine_text:
         changed.append(dflash_engine_path)
 
+    model_settings_text = model_settings_path.read_text()
+    patched_model_settings = _patch_omlx_model_settings_text(model_settings_text)
+    if patched_model_settings != model_settings_text:
+        changed.append(model_settings_path)
+
+    dflash_lifecycle_text = dflash_lifecycle_path.read_text()
+    patched_dflash_lifecycle = _patch_omlx_dflash_lifecycle_text(dflash_lifecycle_text)
+    if patched_dflash_lifecycle != dflash_lifecycle_text:
+        changed.append(dflash_lifecycle_path)
+
     if not dry_run:
         for path in changed:
             originals[path] = path.read_text() if path.exists() else None
@@ -1823,6 +2121,10 @@ def patch_omlx_app_for_minimax(
                 _write_text_with_backup(target_ops_path, patched_target_ops)
             if patched_dflash_engine != dflash_engine_text:
                 _write_text_with_backup(dflash_engine_path, patched_dflash_engine)
+            if patched_model_settings != model_settings_text:
+                _write_text_with_backup(model_settings_path, patched_model_settings)
+            if patched_dflash_lifecycle != dflash_lifecycle_text:
+                _write_text_with_backup(dflash_lifecycle_path, patched_dflash_lifecycle)
         except Exception:
             for path, original in originals.items():
                 if original is None:
@@ -1836,6 +2138,8 @@ def patch_omlx_app_for_minimax(
         target_ops_path=target_ops_path,
         target_backend_path=target_backend_path,
         dflash_engine_path=dflash_engine_path,
+        model_settings_path=model_settings_path,
+        dflash_lifecycle_path=dflash_lifecycle_path,
         changed_paths=tuple(changed),
     )
 
@@ -1925,12 +2229,33 @@ def install_omlx_draft_for_app(
     ssd_cache: bool = True,
     ssd_cache_max_bytes: int = 20 * 1024**3,
     verify_mode: str = "adaptive",
+    draft_quant_enabled: bool = False,
+    draft_quant_weight_bits: int = 4,
+    draft_quant_activation_bits: int = 16,
+    draft_quant_group_size: int = 64,
+    dflash_max_ctx: int | None = None,
+    dflash_draft_window_size: int | None = None,
+    dflash_draft_sink_size: int | None = None,
+    dflash_verify_len_cap: int | None = None,
+    dflash_block_tokens: int | None = None,
 ) -> OmlxInstallResult:
     source_path = Path(resolve_omlx_source_model(source_model))
     draft_dir = Path(draft_dir).expanduser()
     if not (draft_dir / "config.json").exists() or not (draft_dir / "model.safetensors").exists():
         raise ValueError(f"Draft directory is missing config.json/model.safetensors: {draft_dir}")
     _validate_omlx_draft_for_source(source_path, draft_dir)
+    for name, value in {
+        "draft_quant_weight_bits": draft_quant_weight_bits,
+        "draft_quant_activation_bits": draft_quant_activation_bits,
+        "draft_quant_group_size": draft_quant_group_size,
+        "dflash_max_ctx": dflash_max_ctx,
+        "dflash_draft_window_size": dflash_draft_window_size,
+        "dflash_draft_sink_size": dflash_draft_sink_size,
+        "dflash_verify_len_cap": dflash_verify_len_cap,
+        "dflash_block_tokens": dflash_block_tokens,
+    }.items():
+        if value is not None and int(value) < 1:
+            raise ValueError(f"{name} must be positive when provided.")
     compatible, reason = native_omlx_dflash_compatibility(source_path)
     source_key = source_path.name
     target_name = installed_name or f"{source_key}-DFlash-dflasher"
@@ -1966,10 +2291,28 @@ def install_omlx_draft_for_app(
             "dflash_ssd_cache": bool(ssd_cache),
             "dflash_ssd_cache_max_bytes": int(ssd_cache_max_bytes),
             "dflash_verify_mode": verify_mode,
-            "dflash_draft_quant_enabled": False,
+            "dflash_draft_quant_enabled": bool(draft_quant_enabled),
+            "dflash_draft_quant_weight_bits": int(draft_quant_weight_bits),
+            "dflash_draft_quant_activation_bits": int(draft_quant_activation_bits),
+            "dflash_draft_quant_group_size": int(draft_quant_group_size),
+            "turboquant_kv_enabled": False,
+            "specprefill_enabled": False,
+            "mtp_enabled": False,
             "trust_remote_code": True,
         }
     )
+    optional_runtime_settings = {
+        "dflash_max_ctx": dflash_max_ctx,
+        "dflash_draft_window_size": dflash_draft_window_size,
+        "dflash_draft_sink_size": dflash_draft_sink_size,
+        "dflash_verify_len_cap": dflash_verify_len_cap,
+        "dflash_block_tokens": dflash_block_tokens,
+    }
+    for key, value in optional_runtime_settings.items():
+        if value is None:
+            current.pop(key, None)
+        else:
+            current[key] = int(value)
     models[source_key] = current
     backup_path = settings_path.with_suffix(settings_path.suffix + ".dflasher.bak")
     if settings_path.exists() and not backup_path.exists():

@@ -1078,6 +1078,8 @@ def omlx_patch_app(
     table.add_row("target_ops", str(result.target_ops_path))
     table.add_row("target_backend", str(result.target_backend_path))
     table.add_row("dflash_engine", str(result.dflash_engine_path))
+    table.add_row("model_settings", str(result.model_settings_path))
+    table.add_row("dflash_lifecycle", str(result.dflash_lifecycle_path))
     table.add_row("changed", "none" if not result.changed_paths else str(len(result.changed_paths)))
     for path in result.changed_paths:
         table.add_row("changed_path", str(path))
@@ -1118,6 +1120,45 @@ def omlx_install_app(
         str,
         typer.Option(help="DFlash verify mode passed to oMLX."),
     ] = "adaptive",
+    draft_quant: Annotated[
+        bool,
+        typer.Option(
+            "--draft-quant/--no-draft-quant",
+            help="Quantize the draft at oMLX load time to reduce memory pressure.",
+        ),
+    ] = False,
+    draft_quant_weight_bits: Annotated[
+        int,
+        typer.Option(help="Draft quantization weight bits passed to oMLX."),
+    ] = 4,
+    draft_quant_activation_bits: Annotated[
+        int,
+        typer.Option(help="Draft quantization activation bits passed to oMLX."),
+    ] = 16,
+    draft_quant_group_size: Annotated[
+        int,
+        typer.Option(help="Draft quantization group size passed to oMLX."),
+    ] = 64,
+    dflash_max_ctx: Annotated[
+        int | None,
+        typer.Option(help="Prompt token threshold where oMLX falls back from DFlash."),
+    ] = None,
+    dflash_draft_window_size: Annotated[
+        int | None,
+        typer.Option(help="DFlash draft cache window size passed to oMLX."),
+    ] = None,
+    dflash_draft_sink_size: Annotated[
+        int | None,
+        typer.Option(help="DFlash draft sink size passed to oMLX."),
+    ] = None,
+    dflash_verify_len_cap: Annotated[
+        int | None,
+        typer.Option(help="Maximum verifier tokens per DFlash cycle."),
+    ] = None,
+    dflash_block_tokens: Annotated[
+        int | None,
+        typer.Option(help="Maximum DFlash block tokens requested at runtime."),
+    ] = None,
 ):
     """Install a draft into local oMLX model settings."""
     try:
@@ -1131,6 +1172,15 @@ def omlx_install_app(
             overwrite=overwrite,
             ssd_cache=ssd_cache,
             verify_mode=verify_mode,
+            draft_quant_enabled=draft_quant,
+            draft_quant_weight_bits=draft_quant_weight_bits,
+            draft_quant_activation_bits=draft_quant_activation_bits,
+            draft_quant_group_size=draft_quant_group_size,
+            dflash_max_ctx=dflash_max_ctx,
+            dflash_draft_window_size=dflash_draft_window_size,
+            dflash_draft_sink_size=dflash_draft_sink_size,
+            dflash_verify_len_cap=dflash_verify_len_cap,
+            dflash_block_tokens=dflash_block_tokens,
         )
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         console.print(f"[red]{exc}[/red]")

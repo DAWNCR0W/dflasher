@@ -254,8 +254,22 @@ dflasher omlx patch-app --app-path /Applications/oMLX.app
 dflasher omlx install-app \
   ~/.omlx/models/MiniMax-M2.7-ultra-uncensored-heretic-oQ4-MLX \
   ./runs/minimax-m27-oq4-dflash \
-  --overwrite
+  --overwrite \
+  --verify-mode adaptive \
+  --dflash-block-tokens 4 \
+  --dflash-verify-len-cap 4 \
+  --dflash-draft-window-size 2048 \
+  --dflash-draft-sink-size 64
 ```
+
+`patch-app` also installs the local MiniMax-M2 target backend into oMLX, including
+MiniMax tree verification support, a MiniMax attention hook for the verifier
+fast path, and lifecycle cleanup for class-level DFlash monkey patches.
+`install-app` can tune runtime verifier cost separately from the checkpoint
+block size with `--dflash-block-tokens` and `--dflash-verify-len-cap`.
+Use `--draft-quant` when the draft model adds too much memory pressure next to
+an oQ source model; keep `--no-draft-quant` for the fastest path when memory is
+available.
 
 This backend is intentionally explicit: cache extraction loads the source model,
 draft training reads the cache, and evaluation loads the OMLX source model again

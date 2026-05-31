@@ -9,6 +9,8 @@ from dflasher.omlx import (
     OMLX_CACHE_FORMAT,
     OmlxBuildOptions,
     OmlxCacheMetadata,
+    OmlxInstallResult,
+    _patch_omlx_dflash_text,
     _runtime_aligned_anchor_bounds,
     _runtime_aligned_segment_start,
     _runtime_aligned_training_arrays,
@@ -326,6 +328,10 @@ def test_install_omlx_draft_updates_model_settings(monkeypatch, tmp_path):
         draft_dir=draft_dir,
         settings_path=settings_path,
         overwrite=True,
+        dflash_block_tokens=16,
+        dflash_verify_len_cap=16,
+        dflash_draft_window_size=2048,
+        dflash_draft_sink_size=64,
     )
 
     payload = json.loads(settings_path.read_text())
@@ -333,6 +339,17 @@ def test_install_omlx_draft_updates_model_settings(monkeypatch, tmp_path):
     assert settings["dflash_enabled"] is True
     assert settings["dflash_draft_model"] == str(model_root / f"{model_dir.name}-DFlash-dflasher")
     assert settings["dflash_verify_mode"] == "adaptive"
+    assert settings["dflash_draft_quant_enabled"] is False
+    assert settings["dflash_draft_quant_weight_bits"] == 4
+    assert settings["dflash_draft_quant_activation_bits"] == 16
+    assert settings["dflash_draft_quant_group_size"] == 64
+    assert settings["dflash_block_tokens"] == 16
+    assert settings["dflash_verify_len_cap"] == 16
+    assert settings["dflash_draft_window_size"] == 2048
+    assert settings["dflash_draft_sink_size"] == 64
+    assert settings["turboquant_kv_enabled"] is False
+    assert settings["specprefill_enabled"] is False
+    assert settings["mtp_enabled"] is False
     assert result.compatible_with_native_omlx is True
 
 
@@ -437,6 +454,74 @@ def write_fake_omlx_app(path):
                 '        return False, "DFlash supports only Qwen and Gemma4 models"',
                 '    return True, ""',
                 "",
+                "class DFlashEngine:",
+                "    def __init__(self, model_settings=None):",
+                "        self._verify_mode = (",
+                '            getattr(model_settings, "dflash_verify_mode", None)',
+                "            if model_settings",
+                "            else None",
+                "        )",
+                "",
+                "    def _build_runtime_context(self):",
+                "        return runtime_config_from_defaults(",
+                "            verify_mode=self._verify_mode,",
+                "        )",
+                "",
+                "    def _stream_dflash_events(self, prefix_flow):",
+                "        return stream_dflash_generate(",
+                "            publish_generation_snapshot=prefix_flow.publish_generation_snapshot,",
+                "            runtime_context=self._runtime_context,",
+                "        )",
+                "",
+            ]
+        )
+    )
+    omlx_dir = path / "Contents" / "Resources" / "omlx"
+    (omlx_dir / "model_settings.py").write_text(
+        "\n".join(
+            [
+                "from dataclasses import dataclass",
+                "from typing import Optional",
+                "",
+                "@dataclass",
+                "class ModelSettings:",
+                "    dflash_draft_window_size: Optional[int] = None",
+                "    dflash_draft_sink_size: Optional[int] = None",
+                (
+                    '    dflash_verify_mode: Optional[str] = None  # "dflash" | '
+                    '"adaptive" | "ddtree" | "off"'
+                ),
+                "",
+                (
+                    'DOC = """        dflash_draft_sink_size: Attention-sink tokens always '
+                    "kept regardless of window"
+                ),
+                "            (None = dflash default 64).",
+                '"""',
+                "",
+            ]
+        )
+    )
+    patches_dir = omlx_dir / "patches"
+    patches_dir.mkdir()
+    (patches_dir / "dflash_lifecycle.py").write_text(
+        "\n".join(
+            [
+                "def install_dflash_lifecycle_wrap():",
+                "    wrapped_any = False",
+                "    try:",
+                "        from dflash_mlx.engine import target_gemma4 as _gemma4",
+                "    except ImportError:",
+                '        logger.debug("dflash_mlx.engine.target_gemma4 not importable")',
+                "    else:",
+                "        wrapped_any |= _wrap_installer(",
+                "            _gemma4,",
+                '            "_install_full_attention_gqa_hook",',
+                '            "_dflash_full_attention_gqa_installed",',
+                "        )",
+                "",
+                "    return wrapped_any",
+                "",
             ]
         )
     )
@@ -448,15 +533,46 @@ def test_patch_omlx_app_for_minimax_updates_engine_files(tmp_path):
 
     result = patch_omlx_app_for_minimax(app_dir)
 
-    assert len(result.changed_paths) == 3
+    assert len(result.changed_paths) == 5
     assert result.target_backend_path.exists()
     assert "MiniMaxM2TargetOps" in result.target_backend_path.read_text()
     assert "target_minimax_m2:MiniMaxM2TargetOps" in result.target_ops_path.read_text()
     dflash_text = result.dflash_engine_path.read_text()
     assert 'is_minimax_m2 = model_type == "minimax_m2"' in dflash_text
     assert "if not (is_qwen or is_gemma4 or is_minimax_m2):" in dflash_text
+    assert "verify_len_cap=self._verify_len_cap" in dflash_text
+    assert "block_tokens=self._block_tokens" in dflash_text
+    settings_text = result.model_settings_path.read_text()
+    assert "dflash_verify_len_cap" in settings_text
+    assert "dflash_block_tokens" in settings_text
+    lifecycle_text = result.dflash_lifecycle_path.read_text()
+    assert "target_minimax_m2" in lifecycle_text
+    assert "_dflasher_minimax_attention_hook_installed" in lifecycle_text
     assert result.target_ops_path.with_suffix(".py.dflasher.bak").exists()
     assert result.dflash_engine_path.with_suffix(".py.dflasher.bak").exists()
+
+
+def test_patch_omlx_dflash_text_repairs_partial_runtime_knobs(tmp_path):
+    app_dir = write_fake_omlx_app(tmp_path / "oMLX.app")
+    original = (app_dir / "Contents" / "Resources" / "omlx" / "engine" / "dflash.py").read_text()
+    fully_patched = _patch_omlx_dflash_text(original)
+    partially_patched = fully_patched.replace(
+        """        self._block_tokens = (
+            getattr(model_settings, "dflash_block_tokens", None)
+            if model_settings
+            else None
+        )
+""",
+        "",
+        1,
+    )
+
+    repaired = _patch_omlx_dflash_text(partially_patched)
+
+    assert 'getattr(model_settings, "dflash_verify_len_cap", None)' in repaired
+    assert 'getattr(model_settings, "dflash_block_tokens", None)' in repaired
+    assert "verify_len_cap=self._verify_len_cap" in repaired
+    assert "block_tokens=self._block_tokens" in repaired
 
 
 def test_cli_omlx_patch_app_is_idempotent(tmp_path):
@@ -470,3 +586,27 @@ def test_cli_omlx_patch_app_is_idempotent(tmp_path):
     assert "changed" in first.output
     assert second.exit_code == 0
     assert "none" in second.output
+
+
+def test_cli_omlx_install_app_defaults_to_no_draft_quant(monkeypatch, tmp_path):
+    calls = {}
+
+    def fake_install(source_model, draft_dir, **kwargs):
+        calls["source_model"] = source_model
+        calls["draft_dir"] = draft_dir
+        calls["kwargs"] = kwargs
+        return OmlxInstallResult(
+            source_model=source_model,
+            draft_model=str(draft_dir),
+            settings_path=tmp_path / "model_settings.json",
+            compatible_with_native_omlx=True,
+            compatibility_reason="",
+        )
+
+    monkeypatch.setattr("dflasher.cli.install_omlx_draft_for_app", fake_install)
+    runner = CliRunner()
+
+    result = runner.invoke(app, ["omlx", "install-app", "source", "draft"])
+
+    assert result.exit_code == 0
+    assert calls["kwargs"]["draft_quant_enabled"] is False
