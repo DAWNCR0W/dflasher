@@ -4,7 +4,7 @@ import pytest
 import torch
 
 from dflasher.config import DFlasherConfig
-from dflasher.data import sample_batch
+from dflasher.data import load_texts, sample_batch
 from dflasher.training import TrainOptions
 
 
@@ -27,6 +27,15 @@ def test_sample_batch_left_pads_prefix_before_appending_anchor(monkeypatch):
     assert attention_mask.tolist() == [[0, 0, 1], [1, 1, 1]]
     assert anchor_ids.tolist() == [11, 23]
     assert labels.tolist() == [[12, 13], [24, -100]]
+
+
+def test_load_texts_decodes_line_encoded_newlines(tmp_path):
+    texts_file = tmp_path / "texts.txt"
+    texts_file.write_text("SYSTEM:\\nhello\\n\\tUSER: hi\n")
+
+    texts = load_texts(texts_file=str(texts_file))
+
+    assert texts == ["SYSTEM:\nhello\n\tUSER: hi"]
 
 
 def test_invalid_block_size_is_rejected_before_training():

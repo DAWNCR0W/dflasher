@@ -357,21 +357,78 @@ def build(
         typer.Option(help="OMLX cache sample count for --backend omlx/mlx."),
     ] = 8,
     omlx_mask_token_id: Annotated[
-        int,
-        typer.Option(help="OMLX draft mask token id."),
-    ] = 0,
+        int | None,
+        typer.Option(
+            help="OMLX draft mask token id. Defaults to source tokenizer <fim_pad> when available."
+        ),
+    ] = None,
     omlx_intermediate_size: Annotated[
         int | None,
         typer.Option(help="OMLX draft FFN intermediate size. Defaults to source config."),
     ] = None,
     omlx_loss_fn: Annotated[
         str,
-        typer.Option(help="OMLX training loss: hidden-mse, ce, or ce-hidden."),
+        typer.Option(
+            help=(
+                "OMLX training loss: hidden-mse, ce, ce-hidden, topk-kl, "
+                "ce-topk-kl, or ce-hidden-topk-kl."
+            )
+        ),
     ] = "ce-hidden",
     omlx_hidden_loss_weight: Annotated[
         float,
         typer.Option(help="Hidden-state MSE weight when --omlx-loss-fn=ce-hidden."),
     ] = 0.01,
+    omlx_hidden_target: Annotated[
+        str,
+        typer.Option(help="OMLX hidden MSE target: selected or final."),
+    ] = "selected",
+    omlx_target_top_k: Annotated[
+        int,
+        typer.Option(help="Store target top-k logits per next-token position for KL distillation."),
+    ] = 0,
+    omlx_topk_loss_weight: Annotated[
+        float,
+        typer.Option(help="Top-k KL loss weight for topk-kl blended objectives."),
+    ] = 1.0,
+    omlx_topk_temperature: Annotated[
+        float,
+        typer.Option(help="Teacher/student temperature for top-k KL loss."),
+    ] = 1.0,
+    omlx_anchor_span_tokens: Annotated[
+        int,
+        typer.Option(help="Limit generated-token anchor sampling to the first N tokens; 0 disables."),
+    ] = 0,
+    omlx_first_anchor_probability: Annotated[
+        float,
+        typer.Option(help="Probability of sampling the first generated DFlash anchor."),
+    ] = 0.0,
+    omlx_anchor_margin_min: Annotated[
+        float,
+        typer.Option(help="Minimum target top1-top2 logit margin for margin-aware anchors."),
+    ] = 0.0,
+    omlx_anchor_margin_top_fraction: Annotated[
+        float,
+        typer.Option(help="Sample only from the top fraction of target margin anchors; 0 disables."),
+    ] = 0.0,
+    omlx_label_source: Annotated[
+        str,
+        typer.Option(help="OMLX CE label source: raw-next-token or target-greedy."),
+    ] = "raw-next-token",
+    omlx_generated_continuation_tokens: Annotated[
+        int,
+        typer.Option(help="OMLX cache target-greedy continuation tokens appended per prompt."),
+    ] = 0,
+    omlx_use_chat_template: Annotated[
+        bool,
+        typer.Option(help="Tokenize OMLX training texts through the model chat template."),
+    ] = False,
+    omlx_include_prefill_anchors: Annotated[
+        bool,
+        typer.Option(
+            help="Include prompt/prefill token anchors when generated continuations are used."
+        ),
+    ] = False,
 ):
     """Build a draft model from a source model.
 
@@ -472,6 +529,18 @@ def build(
                 learning_rate=learning_rate,
                 loss_fn=omlx_loss_fn,
                 hidden_loss_weight=omlx_hidden_loss_weight,
+                hidden_target=omlx_hidden_target,
+                label_source=omlx_label_source,
+                generated_continuation_tokens=omlx_generated_continuation_tokens,
+                use_chat_template=omlx_use_chat_template,
+                include_prefill_anchors=omlx_include_prefill_anchors,
+                target_top_k=omlx_target_top_k,
+                topk_loss_weight=omlx_topk_loss_weight,
+                topk_temperature=omlx_topk_temperature,
+                anchor_span_tokens=omlx_anchor_span_tokens,
+                first_anchor_probability=omlx_first_anchor_probability,
+                anchor_margin_min=omlx_anchor_margin_min,
+                anchor_margin_top_fraction=omlx_anchor_margin_top_fraction,
                 seed=seed,
                 overwrite=overwrite,
                 train=not plan_only,
@@ -789,7 +858,38 @@ def omlx_extract_cache(
         list[int] | None,
         typer.Option("--target-layer-id", help="Repeatable explicit target hidden layer id."),
     ] = None,
-    mask_token_id: Annotated[int, typer.Option(help="Draft mask token id.")] = 0,
+    mask_token_id: Annotated[
+        int | None,
+        typer.Option(
+            help="Draft mask token id. Defaults to source tokenizer <fim_pad> when available."
+        ),
+    ] = None,
+    label_source: Annotated[
+        str,
+        typer.Option(help="CE label source saved in the cache: raw-next-token or target-greedy."),
+    ] = "raw-next-token",
+    generated_continuation_tokens: Annotated[
+        int,
+        typer.Option(help="Target-greedy continuation tokens appended per prompt."),
+    ] = 0,
+    use_chat_template: Annotated[
+        bool,
+        typer.Option(help="Tokenize each text through the model chat template."),
+    ] = False,
+    include_prefill_anchors: Annotated[
+        bool,
+        typer.Option(
+            help="Include prompt/prefill token anchors when generated continuations are used."
+        ),
+    ] = False,
+    target_top_k: Annotated[
+        int,
+        typer.Option(help="Store target top-k logits per next-token position for KL distillation."),
+    ] = 0,
+    hidden_target: Annotated[
+        str,
+        typer.Option(help="Hidden MSE target saved in the cache: selected or final."),
+    ] = "selected",
     overwrite: Annotated[bool, typer.Option(help="Replace existing cache dir.")] = False,
 ):
     """Extract selected hidden states from a local MLX source model into a cache."""
@@ -809,6 +909,12 @@ def omlx_extract_cache(
             layer_policy=layer_policy,
             target_layer_ids=tuple(target_layer_id) if target_layer_id else None,
             mask_token_id=mask_token_id,
+            label_source=label_source,
+            generated_continuation_tokens=generated_continuation_tokens,
+            use_chat_template=use_chat_template,
+            include_prefill_anchors=include_prefill_anchors,
+            target_top_k=target_top_k,
+            hidden_target=hidden_target,
             overwrite=overwrite,
         )
     except (RuntimeError, ValueError) as exc:
@@ -833,7 +939,12 @@ def omlx_init_draft(
         list[int] | None,
         typer.Option("--target-layer-id", help="Repeatable explicit target hidden layer id."),
     ] = None,
-    mask_token_id: Annotated[int, typer.Option(help="Draft mask token id.")] = 0,
+    mask_token_id: Annotated[
+        int | None,
+        typer.Option(
+            help="Draft mask token id. Defaults to source tokenizer <fim_pad> when available."
+        ),
+    ] = None,
     overwrite: Annotated[bool, typer.Option(help="Replace existing draft dir.")] = False,
 ):
     """Create a local MLX DFlash draft checkpoint skeleton for the source model."""
@@ -873,6 +984,34 @@ def omlx_train(
         float,
         typer.Option(help="Hidden-state MSE weight when --loss-fn=ce-hidden."),
     ] = 0.01,
+    topk_loss_weight: Annotated[
+        float,
+        typer.Option(help="Top-k KL loss weight for topk-kl blended objectives."),
+    ] = 1.0,
+    topk_temperature: Annotated[
+        float,
+        typer.Option(help="Teacher/student temperature for top-k KL loss."),
+    ] = 1.0,
+    anchor_span_tokens: Annotated[
+        int,
+        typer.Option(help="Limit generated-token anchor sampling to the first N tokens; 0 disables."),
+    ] = 0,
+    first_anchor_probability: Annotated[
+        float,
+        typer.Option(help="Probability of sampling the first generated DFlash anchor."),
+    ] = 0.0,
+    anchor_margin_min: Annotated[
+        float,
+        typer.Option(help="Minimum target top1-top2 logit margin for margin-aware anchors."),
+    ] = 0.0,
+    anchor_margin_top_fraction: Annotated[
+        float,
+        typer.Option(help="Sample only from the top fraction of target margin anchors; 0 disables."),
+    ] = 0.0,
+    label_source: Annotated[
+        str | None,
+        typer.Option(help="Expected cache label source; verifies metadata when set."),
+    ] = None,
     seed: Annotated[int, typer.Option(help="Random seed.")] = 13,
 ):
     """Train the OMLX draft from an extracted hidden-state cache."""
@@ -885,6 +1024,13 @@ def omlx_train(
             source_model=source_model,
             loss_fn=loss_fn,
             hidden_loss_weight=hidden_loss_weight,
+            topk_loss_weight=topk_loss_weight,
+            topk_temperature=topk_temperature,
+            anchor_span_tokens=anchor_span_tokens,
+            first_anchor_probability=first_anchor_probability,
+            anchor_margin_min=anchor_margin_min,
+            anchor_margin_top_fraction=anchor_margin_top_fraction,
+            expected_label_source=label_source,
             seed=seed,
         )
     except (RuntimeError, ValueError) as exc:
@@ -922,7 +1068,12 @@ def omlx_build(
         list[int] | None,
         typer.Option("--target-layer-id", help="Repeatable explicit target hidden layer id."),
     ] = None,
-    mask_token_id: Annotated[int, typer.Option(help="Draft mask token id.")] = 0,
+    mask_token_id: Annotated[
+        int | None,
+        typer.Option(
+            help="Draft mask token id. Defaults to source tokenizer <fim_pad> when available."
+        ),
+    ] = None,
     max_steps: Annotated[int, typer.Option(help="Training optimizer steps.")] = 20,
     learning_rate: Annotated[float, typer.Option(help="AdamW learning rate.")] = 1e-4,
     loss_fn: Annotated[
@@ -933,6 +1084,56 @@ def omlx_build(
         float,
         typer.Option(help="Hidden-state MSE weight when --loss-fn=ce-hidden."),
     ] = 0.01,
+    hidden_target: Annotated[
+        str,
+        typer.Option(help="Hidden MSE target: selected or final."),
+    ] = "selected",
+    label_source: Annotated[
+        str,
+        typer.Option(help="CE label source: raw-next-token or target-greedy."),
+    ] = "raw-next-token",
+    generated_continuation_tokens: Annotated[
+        int,
+        typer.Option(help="Target-greedy continuation tokens appended per prompt."),
+    ] = 0,
+    use_chat_template: Annotated[
+        bool,
+        typer.Option(help="Tokenize each text through the model chat template."),
+    ] = False,
+    include_prefill_anchors: Annotated[
+        bool,
+        typer.Option(
+            help="Include prompt/prefill token anchors when generated continuations are used."
+        ),
+    ] = False,
+    target_top_k: Annotated[
+        int,
+        typer.Option(help="Store target top-k logits per next-token position for KL distillation."),
+    ] = 0,
+    topk_loss_weight: Annotated[
+        float,
+        typer.Option(help="Top-k KL loss weight for topk-kl blended objectives."),
+    ] = 1.0,
+    topk_temperature: Annotated[
+        float,
+        typer.Option(help="Teacher/student temperature for top-k KL loss."),
+    ] = 1.0,
+    anchor_span_tokens: Annotated[
+        int,
+        typer.Option(help="Limit generated-token anchor sampling to the first N tokens; 0 disables."),
+    ] = 0,
+    first_anchor_probability: Annotated[
+        float,
+        typer.Option(help="Probability of sampling the first generated DFlash anchor."),
+    ] = 0.0,
+    anchor_margin_min: Annotated[
+        float,
+        typer.Option(help="Minimum target top1-top2 logit margin for margin-aware anchors."),
+    ] = 0.0,
+    anchor_margin_top_fraction: Annotated[
+        float,
+        typer.Option(help="Sample only from the top fraction of target margin anchors; 0 disables."),
+    ] = 0.0,
     seed: Annotated[int, typer.Option(help="Random seed.")] = 13,
     overwrite: Annotated[bool, typer.Option(help="Replace existing outputs.")] = False,
     skip_train: Annotated[
@@ -964,6 +1165,18 @@ def omlx_build(
             learning_rate=learning_rate,
             loss_fn=loss_fn,
             hidden_loss_weight=hidden_loss_weight,
+            hidden_target=hidden_target,
+            label_source=label_source,
+            generated_continuation_tokens=generated_continuation_tokens,
+            use_chat_template=use_chat_template,
+            include_prefill_anchors=include_prefill_anchors,
+            target_top_k=target_top_k,
+            topk_loss_weight=topk_loss_weight,
+            topk_temperature=topk_temperature,
+            anchor_span_tokens=anchor_span_tokens,
+            first_anchor_probability=first_anchor_probability,
+            anchor_margin_min=anchor_margin_min,
+            anchor_margin_top_fraction=anchor_margin_top_fraction,
             seed=seed,
             overwrite=overwrite,
             train=not skip_train,
@@ -981,6 +1194,32 @@ def omlx_generate(
     draft_dir: Annotated[Path, typer.Argument(help="OMLX DFlash draft directory.")],
     prompt: Annotated[str, typer.Option("--prompt", "-p", help="Prompt text.")],
     max_new_tokens: Annotated[int, typer.Option(help="Maximum new tokens.")] = 64,
+    verify_mode: Annotated[str, typer.Option(help="DFlash verify mode.")] = "dflash",
+    block_tokens: Annotated[int | None, typer.Option(help="Requested DFlash block tokens.")] = None,
+    verify_len_cap: Annotated[
+        int | None,
+        typer.Option(help="Max target tokens verified per DFlash cycle."),
+    ] = None,
+    draft_window_size: Annotated[
+        int | None,
+        typer.Option(help="DFlash draft attention window size."),
+    ] = None,
+    draft_sink_size: Annotated[
+        int | None,
+        typer.Option(help="DFlash draft attention sink size."),
+    ] = None,
+    target_fa_window: Annotated[
+        int | None,
+        typer.Option(help="Target flash-attention window; 0 disables offline FA windowing."),
+    ] = None,
+    prefill_step_size: Annotated[
+        int | None,
+        typer.Option(help="Offline DFlash prefill step size."),
+    ] = None,
+    use_chat_template: Annotated[
+        bool,
+        typer.Option(help="Tokenize the prompt through the model chat template."),
+    ] = False,
 ):
     """Generate with an OMLX source model and local MLX DFlash draft."""
     try:
@@ -989,6 +1228,14 @@ def omlx_generate(
             draft_dir=draft_dir,
             prompt=prompt,
             max_new_tokens=max_new_tokens,
+            verify_mode=verify_mode,
+            block_tokens=block_tokens,
+            verify_len_cap=verify_len_cap,
+            draft_window_size=draft_window_size,
+            draft_sink_size=draft_sink_size,
+            target_fa_window=target_fa_window,
+            prefill_step_size=prefill_step_size,
+            use_chat_template=use_chat_template,
         )
     except (RuntimeError, ValueError) as exc:
         console.print(f"[red]{exc}[/red]")
@@ -1006,6 +1253,32 @@ def omlx_eval(
         "Explain speculative decoding in one sentence."
     ),
     max_new_tokens: Annotated[int, typer.Option(help="Maximum new tokens.")] = 32,
+    verify_mode: Annotated[str, typer.Option(help="DFlash verify mode.")] = "dflash",
+    block_tokens: Annotated[int | None, typer.Option(help="Requested DFlash block tokens.")] = None,
+    verify_len_cap: Annotated[
+        int | None,
+        typer.Option(help="Max target tokens verified per DFlash cycle."),
+    ] = None,
+    draft_window_size: Annotated[
+        int | None,
+        typer.Option(help="DFlash draft attention window size."),
+    ] = None,
+    draft_sink_size: Annotated[
+        int | None,
+        typer.Option(help="DFlash draft attention sink size."),
+    ] = None,
+    target_fa_window: Annotated[
+        int | None,
+        typer.Option(help="Target flash-attention window; 0 disables offline FA windowing."),
+    ] = None,
+    prefill_step_size: Annotated[
+        int | None,
+        typer.Option(help="Offline DFlash prefill step size."),
+    ] = None,
+    use_chat_template: Annotated[
+        bool,
+        typer.Option(help="Tokenize prompts through the model chat template."),
+    ] = False,
 ):
     """Check that OMLX DFlash output matches target greedy tokens at temperature 0."""
     try:
@@ -1015,6 +1288,14 @@ def omlx_eval(
             draft_dir=draft_dir,
             prompts=prompts,
             max_new_tokens=max_new_tokens,
+            verify_mode=verify_mode,
+            block_tokens=block_tokens,
+            verify_len_cap=verify_len_cap,
+            draft_window_size=draft_window_size,
+            draft_sink_size=draft_sink_size,
+            target_fa_window=target_fa_window,
+            prefill_step_size=prefill_step_size,
+            use_chat_template=use_chat_template,
         )
     except (RuntimeError, ValueError) as exc:
         console.print(f"[red]{exc}[/red]")
@@ -1077,6 +1358,7 @@ def omlx_patch_app(
     table.add_row("app_path", str(result.app_path))
     table.add_row("target_ops", str(result.target_ops_path))
     table.add_row("target_backend", str(result.target_backend_path))
+    table.add_row("spec_epoch", str(result.spec_epoch_path))
     table.add_row("dflash_engine", str(result.dflash_engine_path))
     table.add_row("model_settings", str(result.model_settings_path))
     table.add_row("dflash_lifecycle", str(result.dflash_lifecycle_path))

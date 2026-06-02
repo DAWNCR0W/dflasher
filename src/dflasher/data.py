@@ -18,6 +18,10 @@ BUILTIN_TEXTS = [
 ]
 
 
+def _decode_line_encoded_text(text: str) -> str:
+    return text.replace("\\n", "\n").replace("\\t", "\t")
+
+
 def load_texts(
     texts_file: str | None = None,
     dataset_name: str | None = None,
@@ -28,7 +32,11 @@ def load_texts(
 ) -> list[str]:
     texts: list[str]
     if texts_file:
-        texts = [line.strip() for line in Path(texts_file).read_text().splitlines() if line.strip()]
+        texts = [
+            _decode_line_encoded_text(line.strip())
+            for line in Path(texts_file).read_text().splitlines()
+            if line.strip()
+        ]
     elif dataset_name:
         dataset = load_dataset(dataset_name, split=dataset_split)
         if limit is not None:

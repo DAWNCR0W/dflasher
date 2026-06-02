@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import random
 import re
@@ -42,6 +43,13 @@ PROTECTED_OMLX_DRAFT_NAMES = frozenset(
 OMLX_LOSS_HIDDEN_MSE = "hidden-mse"
 OMLX_LOSS_CE = "ce"
 OMLX_LOSS_CE_HIDDEN = "ce-hidden"
+OMLX_LOSS_TOPK_KL = "topk-kl"
+OMLX_LOSS_CE_TOPK_KL = "ce-topk-kl"
+OMLX_LOSS_CE_HIDDEN_TOPK_KL = "ce-hidden-topk-kl"
+OMLX_LABEL_RAW_NEXT_TOKEN = "raw-next-token"
+OMLX_LABEL_TARGET_GREEDY = "target-greedy"
+OMLX_HIDDEN_TARGET_SELECTED = "selected"
+OMLX_HIDDEN_TARGET_FINAL = "final"
 OMLX_LOSS_ALIASES = {
     "hidden_mse": OMLX_LOSS_HIDDEN_MSE,
     "mse": OMLX_LOSS_HIDDEN_MSE,
@@ -51,7 +59,54 @@ OMLX_LOSS_ALIASES = {
     "cross_entropy": OMLX_LOSS_CE,
     "ce-hidden": OMLX_LOSS_CE_HIDDEN,
     "ce_hidden": OMLX_LOSS_CE_HIDDEN,
+    "topk-kl": OMLX_LOSS_TOPK_KL,
+    "topk_kl": OMLX_LOSS_TOPK_KL,
+    "kl-topk": OMLX_LOSS_TOPK_KL,
+    "kl_topk": OMLX_LOSS_TOPK_KL,
+    "ce-topk-kl": OMLX_LOSS_CE_TOPK_KL,
+    "ce_topk_kl": OMLX_LOSS_CE_TOPK_KL,
+    "ce-kl": OMLX_LOSS_CE_TOPK_KL,
+    "ce_kl": OMLX_LOSS_CE_TOPK_KL,
+    "ce-hidden-topk-kl": OMLX_LOSS_CE_HIDDEN_TOPK_KL,
+    "ce_hidden_topk_kl": OMLX_LOSS_CE_HIDDEN_TOPK_KL,
+    "ce-hidden-kl": OMLX_LOSS_CE_HIDDEN_TOPK_KL,
+    "ce_hidden_kl": OMLX_LOSS_CE_HIDDEN_TOPK_KL,
 }
+OMLX_LOSSES_WITH_CE = {
+    OMLX_LOSS_CE,
+    OMLX_LOSS_CE_HIDDEN,
+    OMLX_LOSS_CE_TOPK_KL,
+    OMLX_LOSS_CE_HIDDEN_TOPK_KL,
+}
+OMLX_LOSSES_WITH_TOPK_KL = {
+    OMLX_LOSS_TOPK_KL,
+    OMLX_LOSS_CE_TOPK_KL,
+    OMLX_LOSS_CE_HIDDEN_TOPK_KL,
+}
+OMLX_LABEL_SOURCE_ALIASES = {
+    "raw": OMLX_LABEL_RAW_NEXT_TOKEN,
+    "raw-next-token": OMLX_LABEL_RAW_NEXT_TOKEN,
+    "raw_next_token": OMLX_LABEL_RAW_NEXT_TOKEN,
+    "target-greedy": OMLX_LABEL_TARGET_GREEDY,
+    "target_greedy": OMLX_LABEL_TARGET_GREEDY,
+    "greedy": OMLX_LABEL_TARGET_GREEDY,
+}
+OMLX_HIDDEN_TARGET_ALIASES = {
+    "selected": OMLX_HIDDEN_TARGET_SELECTED,
+    "selected-layer": OMLX_HIDDEN_TARGET_SELECTED,
+    "selected_layer": OMLX_HIDDEN_TARGET_SELECTED,
+    "final": OMLX_HIDDEN_TARGET_FINAL,
+    "final-hidden": OMLX_HIDDEN_TARGET_FINAL,
+    "final_hidden": OMLX_HIDDEN_TARGET_FINAL,
+    "final-norm": OMLX_HIDDEN_TARGET_FINAL,
+    "final_norm": OMLX_HIDDEN_TARGET_FINAL,
+}
+OMLX_MASK_TOKEN_CANDIDATES = (
+    "<fim_pad>",
+    "<|fim_pad|>",
+    "<mask>",
+    "[MASK]",
+)
 
 MINIMAX_M2_TARGET_OPS_SOURCE = '''# Copyright 2026 dflasher contributors
 # Licensed under the Apache License, Version 2.0
@@ -63,7 +118,7 @@ from typing import Any, Optional
 
 import mlx.core as mx
 from mlx_lm.models import cache as cache_mod
-from mlx_lm.models.base import create_attention_mask
+from mlx_lm.models.base import create_attention_mask, scaled_dot_product_attention
 
 from dflash_mlx.engine.target_qwen_gdn import (
     _HYBRID_SDPA_EXACT_KV_THRESHOLD,
@@ -74,6 +129,7 @@ from dflash_mlx.engine.target_qwen_gdn import (
     _gqa_reshape_sdpa,
     _set_tree_cache_context,
 )
+from dflash_mlx.engine.sampling import greedy_tokens_with_mask
 from dflash_mlx.engine.target_ops import TargetCapabilities
 
 
@@ -97,6 +153,46 @@ def _minimax_project_qkv(attn: Any, x: mx.array) -> tuple[mx.array, mx.array, mx
     return queries, keys, values
 
 
+def _minimax_gqa_sdpa(
+    queries: mx.array,
+    keys: mx.array,
+    values: mx.array,
+    *,
+    cache: Optional[Any],
+    scale: float,
+    mask: Optional[Any],
+) -> mx.array:
+    _, query_heads, q_len, head_dim = queries.shape
+    _, kv_heads, _kv_len, _ = keys.shape
+    can_use_native_minimax_gqa = (
+        cache is None or not hasattr(cache, "bits")
+    ) and (
+        kv_heads > 0
+        and query_heads != kv_heads
+        and query_heads % kv_heads == 0
+        and int(head_dim) == 128
+        and int(q_len) in (1, 2, 3, 4)
+        and queries.dtype in (mx.bfloat16, mx.float16)
+    )
+    if can_use_native_minimax_gqa:
+        return scaled_dot_product_attention(
+            queries,
+            keys,
+            values,
+            cache=cache,
+            scale=scale,
+            mask=mask,
+        )
+    return _gqa_reshape_sdpa(
+        queries,
+        keys,
+        values,
+        cache=cache,
+        scale=scale,
+        mask=mask,
+    )
+
+
 def _minimax_tree_attention_call(
     attn: Any,
     x: mx.array,
@@ -113,7 +209,7 @@ def _minimax_tree_attention_call(
     keys = _apply_rope_positions(attn.rope, keys, positions)
     keys, values = cache.update_and_fetch(keys, values)
     tree_mask = getattr(cache, "_dflash_tree_attention_mask", mask)
-    output = _gqa_reshape_sdpa(
+    output = _minimax_gqa_sdpa(
         queries,
         keys,
         values,
@@ -163,7 +259,7 @@ def _install_minimax_attention_hook(attn: Any) -> None:
         queries = self.rope(queries, offset=cached_prefix_len)
         keys = self.rope(keys, offset=cached_prefix_len)
         keys, values = cache.update_and_fetch(keys, values)
-        output = _gqa_reshape_sdpa(
+        output = _minimax_gqa_sdpa(
             queries,
             keys,
             values,
@@ -178,8 +274,94 @@ def _install_minimax_attention_hook(attn: Any) -> None:
     cls._dflasher_minimax_attention_hook_installed = True
 
 
+def _minimax_moe_sequential_from_layer() -> int:
+    raw = os.environ.get("DFLASH_MINIMAX_MOE_SEQUENTIAL_FROM_LAYER", "0").strip()
+    try:
+        return int(raw)
+    except ValueError:
+        return 0
+
+
+def _minimax_moe_verify_mode() -> str:
+    return os.environ.get("DFLASH_MINIMAX_MOE_VERIFY_MODE", "sequential").strip().lower()
+
+
+def _minimax_switch_glu_sorted(switch_mlp: Any, x: mx.array, indices: mx.array) -> mx.array:
+    x = mx.expand_dims(x, (-2, -3))
+    *_, expert_count = indices.shape
+    flat_indices = indices.flatten()
+    order = mx.argsort(flat_indices)
+    inv_order = mx.argsort(order)
+    x_sorted = x.flatten(0, -3)[order // expert_count]
+    idx_sorted = flat_indices[order]
+    if getattr(switch_mlp, "training", False):
+        idx_sorted = mx.stop_gradient(idx_sorted)
+    x_up = switch_mlp.up_proj(x_sorted, idx_sorted, sorted_indices=True)
+    x_gate = switch_mlp.gate_proj(x_sorted, idx_sorted, sorted_indices=True)
+    x_out = switch_mlp.down_proj(
+        switch_mlp.activation(x_up, x_gate),
+        idx_sorted,
+        sorted_indices=True,
+    )
+    x_out = x_out[inv_order]
+    x_out = mx.unflatten(x_out, 0, indices.shape)
+    return x_out.squeeze(-2)
+
+
+def _minimax_moe_sorted_call(moe: Any, x: mx.array) -> mx.array | None:
+    if getattr(moe, "sharding_group", None) is not None:
+        return None
+    gates = moe.gate(x.astype(mx.float32))
+    scores = mx.sigmoid(gates)
+    orig_scores = scores
+    scores = scores + moe.e_score_correction_bias
+    k = moe.num_experts_per_tok
+    inds = mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k]
+    scores = mx.take_along_axis(orig_scores, inds, axis=-1)
+    scores = scores / (mx.sum(scores, axis=-1, keepdims=True) + 1e-20)
+    scores = scores.astype(x.dtype)
+    y = _minimax_switch_glu_sorted(moe.switch_mlp, x, inds)
+    return (y * scores[..., None]).sum(axis=-2)
+
+
+def _install_minimax_moe_hook(moe: Any, *, layer_index: int) -> None:
+    setattr(moe, "_dflasher_minimax_layer_index", int(layer_index))
+    cls = type(moe)
+    if getattr(cls, "_dflasher_minimax_moe_hook_installed", False):
+        return
+
+    original_call = cls.__call__
+
+    def moe_call(self, x: mx.array) -> mx.array:
+        seq_len = int(x.shape[1])
+        if seq_len <= 1 or seq_len > 16:
+            return original_call(self, x)
+        layer_idx = int(getattr(self, "_dflasher_minimax_layer_index", 0) or 0)
+        if layer_idx < _minimax_moe_sequential_from_layer():
+            return original_call(self, x)
+        mode = _minimax_moe_verify_mode()
+        if mode == "batched":
+            return original_call(self, x)
+        if mode == "sorted":
+            sorted_out = _minimax_moe_sorted_call(self, x)
+            if sorted_out is not None:
+                return sorted_out
+        chunks = [
+            original_call(self, x[:, index : index + 1, :])
+            for index in range(seq_len)
+        ]
+        return mx.concatenate(chunks, axis=1)
+
+    cls.__call__ = moe_call
+    cls._dflasher_minimax_moe_hook_installed = True
+
+
 class MiniMaxM2TargetOps:
     backend_name = "minimax_m2"
+
+    def __init__(self) -> None:
+        self._last_verify_target_model: Any | None = None
+        self._last_verify_ids: mx.array | None = None
 
     def model_type(self, target_model: Any) -> str:
         args = getattr(target_model, "args", None)
@@ -234,7 +416,7 @@ class MiniMaxM2TargetOps:
             supports_rotating_cache_snapshot=False,
             supports_shared_kv=False,
             supports_target_hidden_capture=True,
-            supports_verify_linear=True,
+            supports_verify_linear=False,
             supports_tree_verify=True,
         )
 
@@ -305,6 +487,8 @@ class MiniMaxM2TargetOps:
     ) -> tuple[mx.array, list[mx.array] | dict[int, mx.array]]:
         if int(verify_ids.shape[1]) <= 0:
             raise ValueError("verify block must contain at least one token")
+        self._last_verify_target_model = target_model
+        self._last_verify_ids = verify_ids
         return self.forward_with_hidden_capture(
             target_model,
             input_ids=verify_ids,
@@ -360,9 +544,13 @@ class MiniMaxM2TargetOps:
         text_model = self.text_model(target_model)
         if getattr(text_model, "_dflash_speculative_hooks_installed", False):
             return
-        for layer in text_model.layers:
-            if hasattr(layer, "self_attn"):
-                _install_minimax_attention_hook(layer.self_attn)
+        for layer_index, layer in enumerate(text_model.layers):
+            attn = getattr(layer, "self_attn", None)
+            if attn is not None:
+                _install_minimax_attention_hook(attn)
+            moe = getattr(layer, "block_sparse_moe", None)
+            if moe is not None:
+                _install_minimax_moe_hook(moe, layer_index=layer_index)
         text_model._dflash_speculative_hooks_installed = True
 
     def make_cache(
@@ -393,15 +581,7 @@ class MiniMaxM2TargetOps:
     def arm_rollback(self, cache_entries: list[Any], *, prefix_len: int) -> None:
         del cache_entries, prefix_len
 
-    def restore_after_acceptance(
-        self,
-        cache_entries: list[Any],
-        *,
-        target_len: int,
-        acceptance_length: int,
-        drafted_tokens: int = 0,
-    ) -> int:
-        del acceptance_length, drafted_tokens
+    def _trim_target_cache(self, cache_entries: list[Any], target_len: int) -> int:
         replay_ns_total = 0
         for cache_entry in cache_entries:
             if hasattr(cache_entry, "trim"):
@@ -417,6 +597,104 @@ class MiniMaxM2TargetOps:
             elif hasattr(cache_entry, "crop"):
                 cache_entry.crop(target_len)
         return replay_ns_total
+
+    def _replay_accepted_draft_tokens(
+        self,
+        cache_entries: list[Any],
+        *,
+        target_len: int,
+        acceptance_length: int,
+    ) -> int:
+        if acceptance_length <= 0 or self._last_verify_ids is None:
+            return self._trim_target_cache(cache_entries, target_len)
+        target_model = self._last_verify_target_model
+        if target_model is None:
+            return self._trim_target_cache(cache_entries, target_len)
+        commit_count = 1 + int(acceptance_length)
+        keep_len = max(0, int(target_len) - commit_count)
+        replay_ns_total = self._trim_target_cache(cache_entries, keep_len)
+        committed_ids = self._last_verify_ids[:, :commit_count]
+        for index in range(commit_count):
+            replay_start_ns = time.perf_counter_ns()
+            logits, _captured = self.forward_with_hidden_capture(
+                target_model,
+                input_ids=committed_ids[:, index : index + 1],
+                cache=cache_entries,
+                capture_layer_ids=set(),
+            )
+            mx.eval(logits)
+            replay_ns_total += time.perf_counter_ns() - replay_start_ns
+        return replay_ns_total
+
+    def restore_after_acceptance(
+        self,
+        cache_entries: list[Any],
+        *,
+        target_len: int,
+        acceptance_length: int,
+        drafted_tokens: int = 0,
+    ) -> int:
+        try:
+            if (
+                os.environ.get("DFLASH_MINIMAX_FULL_COMMIT_CORRECTION") == "1"
+                and acceptance_length > 0
+                and drafted_tokens > 0
+            ):
+                return self._replay_accepted_draft_tokens(
+                    cache_entries,
+                    target_len=target_len,
+                    acceptance_length=acceptance_length,
+                )
+            return self._trim_target_cache(cache_entries, target_len)
+        finally:
+            self._last_verify_target_model = None
+            self._last_verify_ids = None
+
+    def correct_committed_block_after_acceptance(
+        self,
+        *,
+        target_model: Any,
+        target_cache: list[Any],
+        verify_token_ids: mx.array,
+        target_layer_ids: list[int],
+        capture_layer_ids: set[int],
+        prefix_len: int,
+        acceptance_length: int,
+        suppress_token_mask: Optional[mx.array] = None,
+    ) -> dict[str, Any] | None:
+        commit_count = 1 + int(acceptance_length)
+        if commit_count <= 0:
+            raise ValueError("MiniMax-M2 commit correction requires committed tokens")
+        if os.environ.get("DFLASH_MINIMAX_FULL_COMMIT_CORRECTION") != "1":
+            return None
+        replay_start_ns = time.perf_counter_ns()
+        self._trim_target_cache(target_cache, int(prefix_len))
+        committed_ids = verify_token_ids[:, :commit_count].astype(mx.uint32)
+        hidden_chunks: list[mx.array] = []
+        last_logits = None
+        for index in range(commit_count):
+            logits, hidden_states = self.forward_with_hidden_capture(
+                target_model,
+                input_ids=committed_ids[:, index : index + 1],
+                cache=target_cache,
+                capture_layer_ids=capture_layer_ids,
+            )
+            hidden_chunks.append(self.extract_context_feature(hidden_states, target_layer_ids))
+            last_logits = logits[:, -1, :]
+        if last_logits is None:
+            raise RuntimeError("MiniMax-M2 commit correction did not produce logits")
+        committed_hidden = mx.concatenate(hidden_chunks, axis=1)
+        staged_first_next = greedy_tokens_with_mask(
+            last_logits,
+            suppress_token_mask,
+        ).reshape(-1)
+        mx.eval(committed_hidden, last_logits, staged_first_next)
+        return {
+            "committed_hidden": committed_hidden,
+            "last_cycle_logits": last_logits,
+            "staged_first_next": staged_first_next,
+            "replay_ns": time.perf_counter_ns() - replay_start_ns,
+        }
 
     def cleanup_generation_caches(
         self,
@@ -497,6 +775,12 @@ class OmlxCacheMetadata:
     samples: int
     files: tuple[str, ...]
     dtype: str
+    label_source: str = OMLX_LABEL_RAW_NEXT_TOKEN
+    generated_continuation_tokens: int = 0
+    use_chat_template: bool = False
+    include_prefill_anchors: bool = False
+    target_top_k: int = 0
+    hidden_target: str = OMLX_HIDDEN_TARGET_SELECTED
 
     def save(self, cache_dir: Path) -> None:
         payload = asdict(self)
@@ -513,6 +797,17 @@ class OmlxCacheMetadata:
         payload = json.loads((path / "dflasher_omlx_cache.json").read_text())
         payload["selected_layer_ids"] = tuple(payload["selected_layer_ids"])
         payload["files"] = tuple(payload["files"])
+        payload["label_source"] = normalize_omlx_label_source(
+            payload.get("label_source", OMLX_LABEL_RAW_NEXT_TOKEN)
+        )
+        payload["use_chat_template"] = bool(payload.get("use_chat_template", False))
+        payload["include_prefill_anchors"] = bool(
+            payload.get("include_prefill_anchors", False)
+        )
+        payload["target_top_k"] = int(payload.get("target_top_k", 0))
+        payload["hidden_target"] = normalize_omlx_hidden_target(
+            payload.get("hidden_target", OMLX_HIDDEN_TARGET_SELECTED)
+        )
         return cls(**payload)
 
 
@@ -534,11 +829,23 @@ class OmlxBuildOptions:
     intermediate_size: int | None = None
     layer_policy: str = "auto"
     target_layer_ids: tuple[int, ...] | None = None
-    mask_token_id: int = 0
+    mask_token_id: int | None = None
     max_steps: int = 20
     learning_rate: float = 1e-4
     loss_fn: str = OMLX_LOSS_CE_HIDDEN
     hidden_loss_weight: float = 0.01
+    label_source: str = OMLX_LABEL_RAW_NEXT_TOKEN
+    generated_continuation_tokens: int = 0
+    use_chat_template: bool = False
+    include_prefill_anchors: bool = False
+    target_top_k: int = 0
+    hidden_target: str = OMLX_HIDDEN_TARGET_SELECTED
+    topk_loss_weight: float = 1.0
+    topk_temperature: float = 1.0
+    anchor_span_tokens: int = 0
+    first_anchor_probability: float = 0.0
+    anchor_margin_min: float = 0.0
+    anchor_margin_top_fraction: float = 0.0
     seed: int = 13
     overwrite: bool = False
     train: bool = True
@@ -561,6 +868,34 @@ class OmlxBuildOptions:
         normalize_omlx_loss_fn(self.loss_fn)
         if self.hidden_loss_weight < 0:
             raise ValueError("hidden_loss_weight must be non-negative.")
+        normalize_omlx_label_source(self.label_source)
+        normalize_omlx_hidden_target(self.hidden_target)
+        if self.target_top_k < 0:
+            raise ValueError("target_top_k must be non-negative.")
+        if self.topk_loss_weight < 0:
+            raise ValueError("topk_loss_weight must be non-negative.")
+        if self.topk_temperature <= 0:
+            raise ValueError("topk_temperature must be positive.")
+        if self.anchor_span_tokens < 0:
+            raise ValueError("anchor_span_tokens must be non-negative.")
+        if self.first_anchor_probability < 0 or self.first_anchor_probability > 1:
+            raise ValueError("first_anchor_probability must be between 0 and 1.")
+        if self.anchor_margin_min < 0:
+            raise ValueError("anchor_margin_min must be non-negative.")
+        if self.anchor_margin_top_fraction < 0 or self.anchor_margin_top_fraction > 1:
+            raise ValueError("anchor_margin_top_fraction must be between 0 and 1.")
+        if (
+            normalize_omlx_loss_fn(self.loss_fn) in OMLX_LOSSES_WITH_TOPK_KL
+            and self.target_top_k < 1
+        ):
+            raise ValueError("top-k KL losses require target_top_k >= 1.")
+        if self.generated_continuation_tokens < 0:
+            raise ValueError("generated_continuation_tokens must be non-negative.")
+        if (
+            self.generated_continuation_tokens
+            and self.max_length <= self.generated_continuation_tokens
+        ):
+            raise ValueError("max_length must be larger than generated_continuation_tokens.")
         if not self.texts_file and not self.dataset_name and not self.allow_builtin_data:
             raise ValueError(
                 "OMLX build requires --texts-file or --dataset. "
@@ -591,6 +926,7 @@ class OmlxAppPatchResult:
     app_path: Path
     target_ops_path: Path
     target_backend_path: Path
+    spec_epoch_path: Path
     dflash_engine_path: Path
     model_settings_path: Path
     dflash_lifecycle_path: Path
@@ -699,6 +1035,26 @@ def normalize_omlx_loss_fn(loss_fn: str) -> str:
     return normalized
 
 
+def normalize_omlx_label_source(label_source: str) -> str:
+    normalized = OMLX_LABEL_SOURCE_ALIASES.get(label_source.strip().lower())
+    if normalized is None:
+        choices = ", ".join(sorted(set(OMLX_LABEL_SOURCE_ALIASES.values())))
+        raise ValueError(
+            f"Unsupported OMLX label source {label_source!r}; choose one of: {choices}"
+        )
+    return normalized
+
+
+def normalize_omlx_hidden_target(hidden_target: str) -> str:
+    normalized = OMLX_HIDDEN_TARGET_ALIASES.get(hidden_target.strip().lower())
+    if normalized is None:
+        choices = ", ".join(sorted(set(OMLX_HIDDEN_TARGET_ALIASES.values())))
+        raise ValueError(
+            f"Unsupported OMLX hidden target {hidden_target!r}; choose one of: {choices}"
+        )
+    return normalized
+
+
 def resolve_omlx_source_model(source_model: str | Path) -> str:
     raw = Path(str(source_model)).expanduser()
     if raw.exists():
@@ -720,6 +1076,60 @@ def resolve_omlx_source_model(source_model: str | Path) -> str:
     if len(matches) == 1:
         return str(matches[0])
     return str(raw)
+
+
+def _added_token_id_from_decoder(payload: dict[str, Any], token: str) -> int | None:
+    decoder = payload.get("added_tokens_decoder") or {}
+    if isinstance(decoder, dict):
+        for key, value in decoder.items():
+            if isinstance(value, dict) and value.get("content") == token:
+                return int(key)
+    added_tokens = payload.get("added_tokens") or []
+    if isinstance(added_tokens, list):
+        for value in added_tokens:
+            if isinstance(value, dict) and value.get("content") == token:
+                token_id = value.get("id")
+                if token_id is not None:
+                    return int(token_id)
+    return None
+
+
+def _added_token_id_from_files(model_dir: Path, token: str) -> int | None:
+    for file_name in ("tokenizer_config.json", "tokenizer.json"):
+        path = model_dir / file_name
+        if not path.exists():
+            continue
+        try:
+            payload = json.loads(path.read_text())
+        except json.JSONDecodeError:
+            continue
+        token_id = _added_token_id_from_decoder(payload, token)
+        if token_id is not None:
+            return token_id
+    added_tokens_path = model_dir / "added_tokens.json"
+    if added_tokens_path.exists():
+        try:
+            added_tokens = json.loads(added_tokens_path.read_text())
+        except json.JSONDecodeError:
+            added_tokens = {}
+        if isinstance(added_tokens, dict) and token in added_tokens:
+            return int(added_tokens[token])
+    return None
+
+
+def resolve_omlx_mask_token_id(
+    source_model: str | Path,
+    mask_token_id: int | None = None,
+) -> int:
+    if mask_token_id is not None:
+        return int(mask_token_id)
+    model_dir = Path(resolve_omlx_source_model(source_model))
+    if model_dir.exists():
+        for token in OMLX_MASK_TOKEN_CANDIDATES:
+            token_id = _added_token_id_from_files(model_dir, token)
+            if token_id is not None:
+                return token_id
+    return 0
 
 
 def read_model_config(source_model: str | Path) -> dict[str, Any]:
@@ -782,13 +1192,14 @@ def make_omlx_draft_config(
     intermediate_size: int | None = None,
     layer_policy: str = "auto",
     target_layer_ids: tuple[int, ...] | None = None,
-    mask_token_id: int = 0,
+    mask_token_id: int | None = None,
     training_data_source: str = "unknown",
     training_objective: str = OMLX_LOSS_HIDDEN_MSE,
 ) -> OmlxDraftConfig:
     source_model = resolve_omlx_source_model(source_model)
     config = read_model_config(source_model)
     selected_layer_ids = resolve_omlx_layer_ids(source_model, layer_policy, target_layer_ids)
+    resolved_mask_token_id = resolve_omlx_mask_token_id(source_model, mask_token_id)
     hidden_size = int(_config_value(config, "hidden_size"))
     resolved_intermediate_size = (
         int(intermediate_size)
@@ -811,7 +1222,7 @@ def make_omlx_draft_config(
         block_size=block_size,
         target_layer_ids=selected_layer_ids,
         num_target_layers=int(_config_value(config, "num_hidden_layers")),
-        mask_token_id=mask_token_id,
+        mask_token_id=resolved_mask_token_id,
         rope_scaling=_config_value(config, "rope_scaling"),
         layer_types=layer_types,
         sliding_window=_config_value(config, "sliding_window"),
@@ -903,7 +1314,7 @@ def init_omlx_draft(
     intermediate_size: int | None = None,
     layer_policy: str = "auto",
     target_layer_ids: tuple[int, ...] | None = None,
-    mask_token_id: int = 0,
+    mask_token_id: int | None = None,
     training_data_source: str = "unknown",
     training_objective: str = OMLX_LOSS_HIDDEN_MSE,
     overwrite: bool = False,
@@ -981,6 +1392,18 @@ def _get_layers(model) -> list[Any]:
     raise AttributeError(f"Cannot find layers in {type(model).__name__}")
 
 
+def _get_text_model(model):
+    if hasattr(model, "model") and hasattr(model.model, "layers"):
+        return model.model
+    if hasattr(model, "language_model") and hasattr(model.language_model, "model"):
+        inner = model.language_model.model
+        if hasattr(inner, "layers"):
+            return inner
+    if hasattr(model, "layers"):
+        return model
+    raise AttributeError(f"Cannot find text model in {type(model).__name__}")
+
+
 def _get_embed_tokens(model):
     if hasattr(model, "model") and hasattr(model.model, "embed_tokens"):
         return model.model.embed_tokens
@@ -1002,6 +1425,13 @@ def _get_lm_head(model):
     return _get_embed_tokens(model).as_linear
 
 
+def _final_normalized_hidden(model, hidden_states):
+    norm = getattr(_get_text_model(model), "norm", None)
+    if norm is None:
+        return hidden_states
+    return norm(hidden_states)
+
+
 @contextmanager
 def capture_selected_layers(model, layer_ids: tuple[int, ...]) -> Iterator[list[Any]]:
     layers = _get_layers(model)
@@ -1016,11 +1446,249 @@ def capture_selected_layers(model, layer_ids: tuple[int, ...]) -> Iterator[list[
             layers[layer_id] = original
 
 
-def _encode_text(tokenizer, text: str, max_length: int) -> list[int]:
+def _encode_text(
+    tokenizer,
+    text: str,
+    max_length: int,
+    *,
+    use_chat_template: bool = False,
+) -> list[int]:
+    if use_chat_template and hasattr(tokenizer, "apply_chat_template"):
+        tokens = tokenizer.apply_chat_template(
+            [{"role": "user", "content": text}],
+            tokenize=True,
+            add_generation_prompt=True,
+        )
+        return [int(token) for token in list(tokens)[:max_length]]
     bos_token = getattr(tokenizer, "bos_token", None)
     add_special_tokens = bos_token is None or not text.startswith(str(bos_token))
     tokens = tokenizer.encode(text, add_special_tokens=add_special_tokens)
     return [int(token) for token in tokens[:max_length]]
+
+
+def _extend_with_target_greedy_tokens(
+    model,
+    tokenizer,
+    prompt_token_ids: list[int],
+    max_new_tokens: int,
+) -> list[int]:
+    runtime_tokens = _extend_with_dflash_mlx_target_ops_greedy_tokens(
+        model,
+        tokenizer,
+        prompt_token_ids,
+        max_new_tokens,
+    )
+    if runtime_tokens is not None:
+        return runtime_tokens
+    return _extend_with_raw_target_greedy_tokens(
+        model,
+        tokenizer,
+        prompt_token_ids,
+        max_new_tokens,
+    )
+
+
+def _extend_with_dflash_mlx_target_ops_greedy_tokens(
+    model,
+    tokenizer,
+    prompt_token_ids: list[int],
+    max_new_tokens: int,
+) -> list[int] | None:
+    if max_new_tokens <= 0:
+        return list(prompt_token_ids)
+    if not prompt_token_ids:
+        raise ValueError("target-generated cache extraction requires a non-empty prompt")
+    _ensure_omlx_app_site_packages()
+    try:
+        import mlx.core as mx
+        from dflash_mlx.engine.sampling import greedy_tokens_with_mask
+        from dflash_mlx.engine.target_ops import resolve_target_ops
+    except ImportError:
+        return None
+    try:
+        target_ops = resolve_target_ops(model)
+        target_ops.install_speculative_hooks(model)
+        target_cache = target_ops.make_cache(
+            model,
+            enable_speculative_linear_cache=True,
+        )
+        logits = _dflash_mlx_runtime_prefill_logits(
+            target_ops,
+            model,
+            target_cache,
+            prompt_token_ids,
+            mx=mx,
+        )
+    except Exception:
+        return None
+
+    token = greedy_tokens_with_mask(logits[:, -1, :], None).reshape(-1)
+    mx.eval(token)
+    generated = [int(token.item())]
+    eos_ids = _eos_token_ids(tokenizer)
+    for _ in range(max_new_tokens - 1):
+        if generated[-1] in eos_ids:
+            break
+        logits, _captured = target_ops.verify_block(
+            target_model=model,
+            verify_ids=token.reshape(1, 1).astype(mx.uint32),
+            target_cache=target_cache,
+            capture_layer_ids=set(),
+        )
+        token = greedy_tokens_with_mask(logits[:, -1, :], None).reshape(-1)
+        mx.eval(token)
+        generated.append(int(token.item()))
+    return list(prompt_token_ids) + generated
+
+
+def _dflash_mlx_runtime_prefill_logits(
+    target_ops,
+    target_model,
+    target_cache,
+    prompt_token_ids: list[int],
+    *,
+    mx,
+):
+    """Prefill target cache using the same final-token boundary as DFlash serving."""
+
+    if not prompt_token_ids:
+        raise ValueError("DFlash target prefill requires at least one prompt token")
+    prompt_array = mx.array(prompt_token_ids, dtype=mx.uint32)[None, :]
+    if len(prompt_token_ids) > 1:
+        target_ops.forward_with_hidden_capture(
+            target_model,
+            input_ids=prompt_array[:, :-1],
+            cache=target_cache,
+            capture_layer_ids=set(),
+            logits_last_only=True,
+        )
+    logits, _captured = target_ops.forward_with_hidden_capture(
+        target_model,
+        input_ids=prompt_array[:, -1:],
+        cache=target_cache,
+        capture_layer_ids=set(),
+        logits_last_only=True,
+    )
+    return logits
+
+
+def _extend_with_raw_target_greedy_tokens(
+    model,
+    tokenizer,
+    prompt_token_ids: list[int],
+    max_new_tokens: int,
+) -> list[int]:
+    if max_new_tokens <= 0:
+        return list(prompt_token_ids)
+    if not prompt_token_ids:
+        raise ValueError("target-generated cache extraction requires a non-empty prompt")
+    mx, _nn, _optim, _mlx_lm_load, make_prompt_cache, make_sampler = _import_mlx()
+    prompt_ids = mx.array(prompt_token_ids, dtype=mx.uint32)
+    cache = make_prompt_cache(model)
+    sampler = make_sampler(temp=0.0)
+    logits = model(prompt_ids[None, :], cache)
+    token = int(sampler(logits[:, -1:])[0, 0].item())
+    generated = [token]
+    eos_ids = _eos_token_ids(tokenizer)
+    for _ in range(max_new_tokens - 1):
+        if token in eos_ids:
+            break
+        logits = model(mx.array([[token]], dtype=mx.uint32), cache)
+        token = int(sampler(logits[:, -1:])[0, 0].item())
+        generated.append(token)
+    return list(prompt_token_ids) + generated
+
+
+def _captured_layer_hidden(captured: Any, layer_id: int) -> Any:
+    capture_key = int(layer_id) + 1
+    if isinstance(captured, dict):
+        return captured[capture_key]
+    return captured[capture_key]
+
+
+def _extract_target_ops_sequence_features(
+    model,
+    embed_tokens,
+    token_ids: list[int],
+    prompt_len: int,
+    selected_layer_ids: tuple[int, ...],
+    hidden_target: str = OMLX_HIDDEN_TARGET_SELECTED,
+) -> tuple[Any, Any, Any, Any]:
+    _ensure_omlx_app_site_packages()
+    try:
+        import mlx.core as mx
+        from dflash_mlx.engine.target_ops import resolve_target_ops
+    except ImportError as exc:
+        raise RuntimeError(
+            "dflash_mlx target_ops is required for runtime-aligned cache extraction."
+        ) from exc
+
+    if not token_ids:
+        raise ValueError("runtime-aligned cache extraction requires at least one token")
+
+    prompt_len = max(1, min(int(prompt_len), len(token_ids)))
+    hidden_target = normalize_omlx_hidden_target(hidden_target)
+    target_ops = resolve_target_ops(model)
+    target_ops.install_speculative_hooks(model)
+    target_cache = target_ops.make_cache(
+        model,
+        enable_speculative_linear_cache=True,
+    )
+    final_layer_id = len(_get_layers(model)) - 1
+    captured_layer_ids = tuple(dict.fromkeys((*selected_layer_ids, final_layer_id)))
+    capture_layer_ids = {int(layer_id) + 1 for layer_id in captured_layer_ids}
+    context_chunks = []
+    target_chunks = []
+    logits_chunks = []
+
+    def append_features(ids: list[int]) -> None:
+        if not ids:
+            return
+        logits, captured = target_ops.verify_block(
+            target_model=model,
+            verify_ids=mx.array(ids, dtype=mx.uint32)[None, :],
+            target_cache=target_cache,
+            capture_layer_ids=capture_layer_ids,
+        )
+        logits_chunks.append(logits)
+        context_chunks.append(
+            target_ops.extract_context_feature(captured, list(selected_layer_ids))
+        )
+        if hidden_target == OMLX_HIDDEN_TARGET_FINAL:
+            target_chunks.append(
+                _final_normalized_hidden(
+                    model,
+                    _captured_layer_hidden(captured, final_layer_id),
+                )
+            )
+        else:
+            target_chunks.append(_captured_layer_hidden(captured, selected_layer_ids[-1]))
+
+    if prompt_len > 1:
+        append_features(token_ids[: prompt_len - 1])
+        append_features(token_ids[prompt_len - 1 : prompt_len])
+    else:
+        append_features(token_ids[:prompt_len])
+    for token_id in token_ids[prompt_len:]:
+        append_features([int(token_id)])
+
+    context_hidden = (
+        context_chunks[0]
+        if len(context_chunks) == 1
+        else mx.concatenate(context_chunks, axis=1)
+    )
+    target_hidden = (
+        target_chunks[0]
+        if len(target_chunks) == 1
+        else mx.concatenate(target_chunks, axis=1)
+    )
+    logits = (
+        logits_chunks[0]
+        if len(logits_chunks) == 1
+        else mx.concatenate(logits_chunks, axis=1)
+    )
+    token_embeddings = embed_tokens(mx.array(token_ids, dtype=mx.uint32)[None, :])
+    return context_hidden, target_hidden, token_embeddings, logits
 
 
 def _as_numpy(array, dtype: str = "float16") -> np.ndarray:
@@ -1032,6 +1700,37 @@ def _as_numpy(array, dtype: str = "float16") -> np.ndarray:
     if dtype == "float32":
         return out.astype(np.float32)
     raise ValueError("cache dtype must be float16 or float32.")
+
+
+def _target_topk_payload(logits, top_k: int, dtype: str) -> dict[str, np.ndarray]:
+    import mlx.core as mx
+
+    top_k = int(top_k)
+    if top_k < 1:
+        return {}
+    next_token_logits = logits[:, :-1, :]
+    if int(next_token_logits.shape[1]) < 1:
+        return {}
+    vocab_size = int(next_token_logits.shape[-1])
+    top_k = min(top_k, vocab_size)
+    if top_k == vocab_size:
+        indices = mx.argsort(-next_token_logits, axis=-1)
+    else:
+        partitioned = mx.argpartition(
+            next_token_logits,
+            kth=vocab_size - top_k,
+            axis=-1,
+        )
+        indices = partitioned[:, :, -top_k:]
+        values = mx.take_along_axis(next_token_logits, indices, axis=-1)
+        order = mx.argsort(-values, axis=-1)
+        indices = mx.take_along_axis(indices, order, axis=-1)
+    values = mx.take_along_axis(next_token_logits, indices, axis=-1)
+    mx.eval(indices, values)
+    return {
+        "target_topk_indices": np.asarray(indices[0], dtype=np.int64),
+        "target_topk_logits": _as_numpy(values[0], dtype),
+    }
 
 
 def extract_omlx_hidden_cache(
@@ -1048,11 +1747,18 @@ def extract_omlx_hidden_cache(
     block_size: int = 8,
     layer_policy: str = "auto",
     target_layer_ids: tuple[int, ...] | None = None,
-    mask_token_id: int = 0,
+    mask_token_id: int | None = None,
+    label_source: str = OMLX_LABEL_RAW_NEXT_TOKEN,
+    generated_continuation_tokens: int = 0,
+    use_chat_template: bool = False,
+    include_prefill_anchors: bool = False,
+    target_top_k: int = 0,
+    hidden_target: str = OMLX_HIDDEN_TARGET_SELECTED,
     dtype: str = "float16",
     overwrite: bool = False,
 ) -> Path:
     source_model = resolve_omlx_source_model(source_model)
+    resolved_mask_token_id = resolve_omlx_mask_token_id(source_model, mask_token_id)
     if cache_dir.exists():
         if not overwrite:
             raise ValueError(f"Cache path already exists. Pass --overwrite: {cache_dir}")
@@ -1060,6 +1766,13 @@ def extract_omlx_hidden_cache(
     work_dir = cache_dir.parent / f".{cache_dir.name}.tmp-{os.getpid()}-{time.time_ns()}"
     work_dir.mkdir(parents=True)
     mx, _nn, _optim, mlx_lm_load, _make_prompt_cache, _make_sampler = _import_mlx()
+    label_source = normalize_omlx_label_source(label_source)
+    hidden_target = normalize_omlx_hidden_target(hidden_target)
+    generated_continuation_tokens = int(generated_continuation_tokens)
+    if generated_continuation_tokens < 0:
+        raise ValueError("generated_continuation_tokens must be non-negative.")
+    if target_top_k < 0:
+        raise ValueError("target_top_k must be non-negative.")
     selected_layer_ids = resolve_omlx_layer_ids(source_model, layer_policy, target_layer_ids)
     config = read_model_config(source_model)
     hidden_size = int(_config_value(config, "hidden_size"))
@@ -1077,35 +1790,125 @@ def extract_omlx_hidden_cache(
     if hasattr(model, "eval"):
         model.eval()
     embed_tokens = _get_embed_tokens(model)
-    mask_embedding = embed_tokens(mx.array([mask_token_id]))[0]
+    mask_embedding = embed_tokens(mx.array([resolved_mask_token_id]))[0]
     sample_files: list[str] = []
     started = time.perf_counter()
     try:
         for text in texts:
             if len(sample_files) >= max_samples:
                 break
-            token_ids = _encode_text(tokenizer, text, max_length)
+            if generated_continuation_tokens > 0:
+                prompt_max_length = max(1, max_length - generated_continuation_tokens)
+                prompt_ids = _encode_text(
+                    tokenizer,
+                    text,
+                    prompt_max_length,
+                    use_chat_template=use_chat_template,
+                )
+                token_ids = _extend_with_target_greedy_tokens(
+                    model,
+                    tokenizer,
+                    prompt_ids,
+                    generated_continuation_tokens,
+                )[:max_length]
+                prompt_len = len(prompt_ids)
+                min_anchor = 1 if include_prefill_anchors else prompt_len
+            else:
+                token_ids = _encode_text(
+                    tokenizer,
+                    text,
+                    max_length,
+                    use_chat_template=use_chat_template,
+                )
+                min_anchor = None
             if len(token_ids) < block_size + 1:
                 continue
-            input_ids = mx.array(token_ids, dtype=mx.uint32)[None, :]
-            with capture_selected_layers(model, selected_layer_ids) as captured:
-                logits = model(input_ids)
-                selected = [hidden for hidden in captured if hidden is not None]
-                if len(selected) != len(selected_layer_ids):
-                    raise RuntimeError("Failed to capture every selected hidden-state layer.")
-                context_hidden = mx.concatenate(selected, axis=-1)
-                target_hidden = selected[-1]
-                token_embeddings = embed_tokens(input_ids)
-            mx.eval(logits, context_hidden, target_hidden, token_embeddings, mask_embedding)
+            if min_anchor is not None and len(token_ids) < min_anchor + block_size + 1:
+                continue
+            if min_anchor is not None:
+                (
+                    context_hidden,
+                    target_hidden,
+                    token_embeddings,
+                    logits,
+                ) = _extract_target_ops_sequence_features(
+                    model,
+                    embed_tokens,
+                    token_ids,
+                    prompt_len,
+                    selected_layer_ids,
+                    hidden_target=hidden_target,
+                )
+                target_greedy_tokens = (
+                    mx.argmax(logits[:, :-1, :], axis=-1)[0]
+                    if label_source == OMLX_LABEL_TARGET_GREEDY
+                    else None
+                )
+                eval_values = [
+                    logits,
+                    context_hidden,
+                    target_hidden,
+                    token_embeddings,
+                    mask_embedding,
+                ]
+            else:
+                input_ids = mx.array(token_ids, dtype=mx.uint32)[None, :]
+                final_layer_id = len(_get_layers(model)) - 1
+                captured_layer_ids = tuple(dict.fromkeys((*selected_layer_ids, final_layer_id)))
+                with capture_selected_layers(model, captured_layer_ids) as captured:
+                    logits = model(input_ids)
+                    captured_by_layer = dict(zip(captured_layer_ids, captured, strict=True))
+                    selected = [
+                        captured_by_layer[layer_id]
+                        for layer_id in selected_layer_ids
+                        if captured_by_layer[layer_id] is not None
+                    ]
+                    if len(selected) != len(selected_layer_ids):
+                        raise RuntimeError("Failed to capture every selected hidden-state layer.")
+                    context_hidden = mx.concatenate(selected, axis=-1)
+                    if hidden_target == OMLX_HIDDEN_TARGET_FINAL:
+                        target_hidden = _final_normalized_hidden(
+                            model,
+                            captured_by_layer[final_layer_id],
+                        )
+                    else:
+                        target_hidden = selected[-1]
+                    token_embeddings = embed_tokens(input_ids)
+                    target_greedy_tokens = (
+                        mx.argmax(logits[:, :-1, :], axis=-1)[0]
+                        if label_source == OMLX_LABEL_TARGET_GREEDY
+                        else None
+                    )
+                eval_values = [
+                    logits,
+                    context_hidden,
+                    target_hidden,
+                    token_embeddings,
+                    mask_embedding,
+                ]
+            if target_greedy_tokens is not None and not isinstance(
+                target_greedy_tokens, np.ndarray
+            ):
+                eval_values.append(target_greedy_tokens)
+            topk_payload = _target_topk_payload(logits, target_top_k, dtype)
+            mx.eval(*eval_values)
             sample_name = f"sample_{len(sample_files):05d}.npz"
-            np.savez_compressed(
-                work_dir / sample_name,
-                tokens=np.asarray(token_ids, dtype=np.int64),
-                context_hidden=_as_numpy(context_hidden[0], dtype),
-                target_hidden=_as_numpy(target_hidden[0], dtype),
-                token_embeddings=_as_numpy(token_embeddings[0], dtype),
-                mask_embedding=_as_numpy(mask_embedding, dtype),
-            )
+            sample_payload = {
+                "tokens": np.asarray(token_ids, dtype=np.int64),
+                "context_hidden": _as_numpy(context_hidden[0], dtype),
+                "target_hidden": _as_numpy(target_hidden[0], dtype),
+                "token_embeddings": _as_numpy(token_embeddings[0], dtype),
+                "mask_embedding": _as_numpy(mask_embedding, dtype),
+            }
+            sample_payload.update(topk_payload)
+            if target_greedy_tokens is not None:
+                sample_payload["target_greedy_tokens"] = np.asarray(
+                    target_greedy_tokens,
+                    dtype=np.int64,
+                )
+            if min_anchor is not None:
+                sample_payload["min_anchor"] = np.asarray(min_anchor, dtype=np.int64)
+            np.savez_compressed(work_dir / sample_name, **sample_payload)
             sample_files.append(sample_name)
             console.print(f"[dim]cached sample {len(sample_files)} tokens={len(token_ids)}[/dim]")
         if not sample_files:
@@ -1118,11 +1921,17 @@ def extract_omlx_hidden_cache(
             context_width=hidden_size * len(selected_layer_ids),
             vocab_size=vocab_size,
             block_size=block_size,
-            mask_token_id=mask_token_id,
+            mask_token_id=resolved_mask_token_id,
             max_length=max_length,
             samples=len(sample_files),
             files=tuple(sample_files),
             dtype=dtype,
+            label_source=label_source,
+            generated_continuation_tokens=generated_continuation_tokens,
+            use_chat_template=bool(use_chat_template),
+            include_prefill_anchors=bool(include_prefill_anchors),
+            target_top_k=int(target_top_k),
+            hidden_target=hidden_target,
         )
         metadata.save(work_dir)
         if cache_dir.exists():
@@ -1212,9 +2021,44 @@ def _runtime_aligned_training_arrays(
         "cache_context_hidden": sample["context_hidden"][:segment_start],
         "context_hidden": sample["context_hidden"][segment_start:anchor],
         "target_hidden": sample["target_hidden"][label_start:label_end],
-        "label_tokens": sample["tokens"][label_start:label_end],
+        "label_tokens": _runtime_aligned_label_tokens(sample, metadata, anchor),
         "anchor_embedding": sample["token_embeddings"][anchor],
         "mask_embedding": sample["mask_embedding"],
+        **_runtime_aligned_topk_arrays(sample, metadata, anchor),
+    }
+
+
+def _runtime_aligned_label_tokens(
+    sample: dict[str, np.ndarray],
+    metadata: OmlxCacheMetadata,
+    anchor: int,
+) -> np.ndarray:
+    greedy_tokens = sample.get("target_greedy_tokens")
+    if metadata.label_source == OMLX_LABEL_TARGET_GREEDY and greedy_tokens is not None:
+        label_start = anchor
+        label_end = anchor + metadata.block_size - 1
+        return greedy_tokens[label_start:label_end]
+    label_start = anchor + 1
+    label_end = anchor + metadata.block_size
+    return sample["tokens"][label_start:label_end]
+
+
+def _runtime_aligned_topk_arrays(
+    sample: dict[str, np.ndarray],
+    metadata: OmlxCacheMetadata,
+    anchor: int,
+) -> dict[str, np.ndarray]:
+    if metadata.target_top_k < 1:
+        return {}
+    indices = sample.get("target_topk_indices")
+    logits = sample.get("target_topk_logits")
+    if indices is None or logits is None:
+        return {}
+    label_start = anchor
+    label_end = anchor + metadata.block_size - 1
+    return {
+        "target_topk_indices": indices[label_start:label_end],
+        "target_topk_logits": logits[label_start:label_end],
     }
 
 
@@ -1230,6 +2074,118 @@ def _runtime_aligned_segment_start(
     max_segment_len = min(metadata.block_size, anchor - min_anchor)
     segment_len = rng.randint(1, max_segment_len)
     return anchor - segment_len
+
+
+def _runtime_aligned_anchor_sample_bounds(
+    min_anchor: int,
+    max_anchor: int,
+    anchor_span_tokens: int = 0,
+) -> tuple[int, int]:
+    anchor_span_tokens = int(anchor_span_tokens)
+    if anchor_span_tokens < 0:
+        raise ValueError("anchor_span_tokens must be non-negative.")
+    if anchor_span_tokens <= 0:
+        return min_anchor, max_anchor
+    return min_anchor, min(max_anchor, min_anchor + anchor_span_tokens)
+
+
+def _sample_runtime_aligned_anchor(
+    min_anchor: int,
+    max_anchor: int,
+    metadata: OmlxCacheMetadata,
+    rng: random.Random,
+    *,
+    anchor_span_tokens: int = 0,
+    first_anchor_probability: float = 0.0,
+) -> int:
+    first_anchor_probability = float(first_anchor_probability)
+    if first_anchor_probability < 0 or first_anchor_probability > 1:
+        raise ValueError("first_anchor_probability must be between 0 and 1.")
+    sampled_min, sampled_max = _runtime_aligned_anchor_sample_bounds(
+        min_anchor,
+        max_anchor,
+        anchor_span_tokens,
+    )
+    if sampled_max == sampled_min:
+        return sampled_min
+    if metadata.generated_continuation_tokens > 0:
+        if first_anchor_probability > 0 and rng.random() < first_anchor_probability:
+            return sampled_min
+        return rng.randint(sampled_min, sampled_max)
+    if rng.random() < 0.5:
+        return sampled_min
+    return rng.randint(sampled_min + 1, sampled_max)
+
+
+def _sample_margin_aligned_anchor(
+    sample: dict[str, np.ndarray],
+    min_anchor: int,
+    max_anchor: int,
+    metadata: OmlxCacheMetadata,
+    rng: random.Random,
+    *,
+    anchor_span_tokens: int = 0,
+    first_anchor_probability: float = 0.0,
+    anchor_margin_min: float = 0.0,
+    anchor_margin_top_fraction: float = 0.0,
+) -> int:
+    anchor_margin_min = float(anchor_margin_min)
+    anchor_margin_top_fraction = float(anchor_margin_top_fraction)
+    if anchor_margin_min <= 0 and anchor_margin_top_fraction <= 0:
+        return _sample_runtime_aligned_anchor(
+            min_anchor,
+            max_anchor,
+            metadata,
+            rng,
+            anchor_span_tokens=anchor_span_tokens,
+            first_anchor_probability=first_anchor_probability,
+        )
+    sampled_min, sampled_max = _runtime_aligned_anchor_sample_bounds(
+        min_anchor,
+        max_anchor,
+        anchor_span_tokens,
+    )
+    if sampled_max == sampled_min:
+        return sampled_min
+    if (
+        metadata.generated_continuation_tokens > 0
+        and first_anchor_probability > 0
+        and rng.random() < first_anchor_probability
+    ):
+        return sampled_min
+    topk_logits = sample.get("target_topk_logits")
+    if topk_logits is None or int(topk_logits.shape[-1]) < 2:
+        return _sample_runtime_aligned_anchor(
+            min_anchor,
+            max_anchor,
+            metadata,
+            rng,
+            anchor_span_tokens=anchor_span_tokens,
+            first_anchor_probability=0.0,
+        )
+    anchor_start = max(0, sampled_min)
+    anchor_end = min(sampled_max, int(topk_logits.shape[0]) - 1)
+    if anchor_end < anchor_start:
+        return _sample_runtime_aligned_anchor(
+            min_anchor,
+            max_anchor,
+            metadata,
+            rng,
+            anchor_span_tokens=anchor_span_tokens,
+            first_anchor_probability=0.0,
+        )
+    margins = np.asarray(topk_logits[anchor_start : anchor_end + 1, :2], dtype=np.float32)
+    margins = margins[:, 0] - margins[:, 1]
+    candidate_offsets = np.arange(margins.shape[0])
+    if anchor_margin_min > 0:
+        candidate_offsets = candidate_offsets[margins >= anchor_margin_min]
+    if candidate_offsets.size == 0:
+        candidate_offsets = np.arange(margins.shape[0])
+    if anchor_margin_top_fraction > 0 and candidate_offsets.size > 1:
+        keep_count = max(1, math.ceil(candidate_offsets.size * anchor_margin_top_fraction))
+        ranked_offsets = candidate_offsets[np.argsort(-margins[candidate_offsets])]
+        candidate_offsets = ranked_offsets[:keep_count]
+    return int(anchor_start + int(rng.choice(candidate_offsets.tolist())))
 
 
 def _make_draft_cache(draft):
@@ -1284,6 +2240,19 @@ def _softcap_logits(logits, cap: float | None):
     return mx.tanh(logits / cap) * cap
 
 
+def _topk_soft_cross_entropy(logits, topk_indices, topk_logits, temperature: float):
+    mx, _nn, _optim, _mlx_lm_load, _make_prompt_cache, _make_sampler = _import_mlx()
+    temperature = float(temperature)
+    student_logits = logits / temperature
+    teacher_logits = topk_logits / temperature
+    gathered_student = mx.take_along_axis(student_logits, topk_indices, axis=-1)
+    teacher_log_norm = mx.logsumexp(teacher_logits, axis=-1, keepdims=True)
+    teacher_probs = mx.exp(teacher_logits - teacher_log_norm)
+    student_log_norm = mx.logsumexp(gathered_student, axis=-1, keepdims=True)
+    student_log_probs = gathered_student - student_log_norm
+    return -(teacher_probs * student_log_probs).sum(axis=-1).mean() * (temperature**2)
+
+
 def _bind_dflash_mlx_draft_to_target(draft, target_model) -> None:
     if not hasattr(draft, "bind_target_model"):
         return
@@ -1335,6 +2304,13 @@ def train_omlx_draft_from_cache(
     source_model: str | None = None,
     loss_fn: str = OMLX_LOSS_CE_HIDDEN,
     hidden_loss_weight: float = 0.01,
+    topk_loss_weight: float = 1.0,
+    topk_temperature: float = 1.0,
+    anchor_span_tokens: int = 0,
+    first_anchor_probability: float = 0.0,
+    anchor_margin_min: float = 0.0,
+    anchor_margin_top_fraction: float = 0.0,
+    expected_label_source: str | None = None,
     seed: int = 13,
 ) -> Path:
     if max_steps < 1:
@@ -1342,10 +2318,43 @@ def train_omlx_draft_from_cache(
     loss_name = normalize_omlx_loss_fn(loss_fn)
     if hidden_loss_weight < 0:
         raise ValueError("hidden_loss_weight must be non-negative.")
+    if topk_loss_weight < 0:
+        raise ValueError("topk_loss_weight must be non-negative.")
+    if topk_temperature <= 0:
+        raise ValueError("topk_temperature must be positive.")
+    if anchor_span_tokens < 0:
+        raise ValueError("anchor_span_tokens must be non-negative.")
+    if first_anchor_probability < 0 or first_anchor_probability > 1:
+        raise ValueError("first_anchor_probability must be between 0 and 1.")
+    if anchor_margin_min < 0:
+        raise ValueError("anchor_margin_min must be non-negative.")
+    if anchor_margin_top_fraction < 0 or anchor_margin_top_fraction > 1:
+        raise ValueError("anchor_margin_top_fraction must be between 0 and 1.")
     mx, nn, optim, mlx_lm_load, _make_prompt_cache, _make_sampler = _import_mlx()
     metadata = OmlxCacheMetadata.load(cache_dir)
+    if expected_label_source is not None:
+        expected = normalize_omlx_label_source(expected_label_source)
+        if metadata.label_source != expected:
+            raise ValueError(
+                "OMLX cache label_source mismatch: "
+                f"{metadata.label_source} != expected {expected}"
+            )
+    if (
+        metadata.label_source == OMLX_LABEL_TARGET_GREEDY
+        and metadata.generated_continuation_tokens <= 0
+        and loss_name == OMLX_LOSS_CE_HIDDEN
+        and hidden_loss_weight > 0
+    ):
+        raise ValueError(
+            "target-greedy label caches must use --loss-fn ce or --hidden-loss-weight 0. "
+            "Raw-sequence hidden states can conflict with target-greedy token labels."
+        )
     if metadata.cache_format != OMLX_CACHE_FORMAT:
         raise ValueError(f"Unsupported OMLX cache format: {metadata.cache_format}")
+    if loss_name in OMLX_LOSSES_WITH_TOPK_KL and metadata.target_top_k < 1:
+        raise ValueError("top-k KL losses require an OMLX cache extracted with target_top_k >= 1.")
+    if (anchor_margin_min > 0 or anchor_margin_top_fraction > 0) and metadata.target_top_k < 2:
+        raise ValueError("margin-aware anchor sampling requires a cache with target_top_k >= 2.")
     draft_config = read_omlx_draft_config(draft_dir)
     _verify_cache_matches_draft(metadata, draft_config)
     draft = load_omlx_draft(draft_dir)
@@ -1354,9 +2363,9 @@ def train_omlx_draft_from_cache(
     optimizer = optim.AdamW(learning_rate=learning_rate)
     lm_head = None
     target_model = None
-    if loss_name in {OMLX_LOSS_CE, OMLX_LOSS_CE_HIDDEN}:
+    if loss_name in OMLX_LOSSES_WITH_CE or loss_name in OMLX_LOSSES_WITH_TOPK_KL:
         target_ref = resolve_omlx_source_model(source_model or metadata.source_model)
-        console.print(f"[bold]Loading OMLX target lm_head for CE loss[/bold] {target_ref}")
+        console.print(f"[bold]Loading OMLX target lm_head for token loss[/bold] {target_ref}")
         target_model, _tokenizer = mlx_lm_load(target_ref, lazy=True)
         if hasattr(target_model, "eval"):
             target_model.eval()
@@ -1376,6 +2385,8 @@ def train_omlx_draft_from_cache(
         block_embeddings,
         label_hidden,
         label_tokens,
+        target_topk_indices,
+        target_topk_logits,
     ):
         draft_cache = _make_draft_cache(model)
         if int(cache_context_hidden.shape[1]) > 0:
@@ -1391,16 +2402,36 @@ def train_omlx_draft_from_cache(
         if loss_name == OMLX_LOSS_HIDDEN_MSE:
             return hidden_loss
         if lm_head is None:
-            raise RuntimeError("CE training requires a loaded target lm_head.")
+            raise RuntimeError("token training requires a loaded target lm_head.")
         logits = _softcap_logits(lm_head(pred), draft_config.final_logit_softcapping)
         ce_loss = nn.losses.cross_entropy(logits, label_tokens, reduction="mean")
         if loss_name == OMLX_LOSS_CE:
             return ce_loss
+        topk_loss = None
+        if loss_name in OMLX_LOSSES_WITH_TOPK_KL:
+            if target_topk_indices is None or target_topk_logits is None:
+                raise RuntimeError("top-k KL loss requires target_topk arrays in the cache sample.")
+            topk_loss = _topk_soft_cross_entropy(
+                logits,
+                target_topk_indices,
+                target_topk_logits,
+                topk_temperature,
+            )
+        if loss_name == OMLX_LOSS_TOPK_KL:
+            return topk_loss
+        if loss_name == OMLX_LOSS_CE_TOPK_KL:
+            return ce_loss + (topk_loss_weight * topk_loss)
+        if loss_name == OMLX_LOSS_CE_HIDDEN_TOPK_KL:
+            return (
+                ce_loss
+                + (topk_loss_weight * topk_loss)
+                + (hidden_loss_weight * hidden_loss)
+            )
         return ce_loss + (hidden_loss_weight * hidden_loss)
 
     value_and_grad = nn.value_and_grad(draft, loss_fn_inner)
     progress = trange(max_steps, desc="omlx-draft-training", leave=True)
-    for _ in progress:
+    for step in progress:
         sample = rng.choice(samples)
         token_count = int(sample["tokens"].shape[0])
         min_anchor, max_anchor = _runtime_aligned_anchor_bounds(
@@ -1408,10 +2439,17 @@ def train_omlx_draft_from_cache(
             metadata.block_size,
             _sample_min_anchor(sample),
         )
-        if max_anchor == min_anchor or rng.random() < 0.5:
-            anchor = min_anchor
-        else:
-            anchor = rng.randint(min_anchor + 1, max_anchor)
+        anchor = _sample_margin_aligned_anchor(
+            sample,
+            min_anchor,
+            max_anchor,
+            metadata,
+            rng,
+            anchor_span_tokens=anchor_span_tokens,
+            first_anchor_probability=first_anchor_probability,
+            anchor_margin_min=anchor_margin_min,
+            anchor_margin_top_fraction=anchor_margin_top_fraction,
+        )
         segment_start = (
             _runtime_aligned_segment_start(sample, metadata, anchor, rng)
             if supports_split_context_cache
@@ -1427,6 +2465,15 @@ def train_omlx_draft_from_cache(
         context_hidden = mx.array(window["context_hidden"][None, :, :])
         target_hidden = mx.array(window["target_hidden"][None, :, :])
         label_tokens = mx.array(window["label_tokens"][None, :], dtype=mx.uint32)
+        if loss_name in OMLX_LOSSES_WITH_TOPK_KL:
+            target_topk_indices = mx.array(
+                window["target_topk_indices"][None, :, :],
+                dtype=mx.uint32,
+            )
+            target_topk_logits = mx.array(window["target_topk_logits"][None, :, :])
+        else:
+            target_topk_indices = None
+            target_topk_logits = None
         anchor_embedding = mx.array(window["anchor_embedding"])
         mask_embedding = mx.array(window["mask_embedding"])
         mask_block = mx.broadcast_to(
@@ -1443,9 +2490,13 @@ def train_omlx_draft_from_cache(
             block_embeddings,
             target_hidden,
             label_tokens,
+            target_topk_indices,
+            target_topk_logits,
         )
         optimizer.update(draft, grads)
         mx.eval(draft.parameters(), optimizer.state, loss)
+        if (int(step) + 1) % 64 == 0 and hasattr(mx, "clear_cache"):
+            mx.clear_cache()
         progress.set_postfix(loss=f"{float(loss.item()):.5f}")
     draft.save_weights(str(draft_dir / "model.safetensors"))
     config_path = draft_dir / "config.json"
@@ -1460,6 +2511,13 @@ def train_omlx_draft_from_cache(
         "learning_rate": learning_rate,
         "objective": loss_name,
         "hidden_loss_weight": hidden_loss_weight,
+        "topk_loss_weight": topk_loss_weight,
+        "topk_temperature": topk_temperature,
+        "anchor_span_tokens": anchor_span_tokens,
+        "first_anchor_probability": first_anchor_probability,
+        "anchor_margin_min": anchor_margin_min,
+        "anchor_margin_top_fraction": anchor_margin_top_fraction,
+        "hidden_target": metadata.hidden_target,
         "format": OMLX_DRAFT_FORMAT,
     }
     (draft_dir / "dflasher_omlx_train_manifest.json").write_text(
@@ -1498,6 +2556,12 @@ def build_omlx_draft(options: OmlxBuildOptions) -> Path:
         layer_policy=options.layer_policy,
         target_layer_ids=options.target_layer_ids,
         mask_token_id=options.mask_token_id,
+        label_source=options.label_source,
+        generated_continuation_tokens=options.generated_continuation_tokens,
+        use_chat_template=options.use_chat_template,
+        include_prefill_anchors=options.include_prefill_anchors,
+        target_top_k=options.target_top_k,
+        hidden_target=options.hidden_target,
         overwrite=options.overwrite,
     )
     init_omlx_draft(
@@ -1522,6 +2586,13 @@ def build_omlx_draft(options: OmlxBuildOptions) -> Path:
             source_model=source_model,
             loss_fn=options.loss_fn,
             hidden_loss_weight=options.hidden_loss_weight,
+            topk_loss_weight=options.topk_loss_weight,
+            topk_temperature=options.topk_temperature,
+            anchor_span_tokens=options.anchor_span_tokens,
+            first_anchor_probability=options.first_anchor_probability,
+            anchor_margin_min=options.anchor_margin_min,
+            anchor_margin_top_fraction=options.anchor_margin_top_fraction,
+            expected_label_source=options.label_source,
             seed=options.seed,
         )
     build_manifest = {
@@ -1530,7 +2601,19 @@ def build_omlx_draft(options: OmlxBuildOptions) -> Path:
         "output": str(options.output_dir),
         "cache_dir": str(cache_dir),
         "training_objective": normalize_omlx_loss_fn(options.loss_fn),
+        "label_source": normalize_omlx_label_source(options.label_source),
+        "generated_continuation_tokens": options.generated_continuation_tokens,
+        "use_chat_template": options.use_chat_template,
+        "include_prefill_anchors": options.include_prefill_anchors,
         "hidden_loss_weight": options.hidden_loss_weight,
+        "target_top_k": options.target_top_k,
+        "hidden_target": normalize_omlx_hidden_target(options.hidden_target),
+        "topk_loss_weight": options.topk_loss_weight,
+        "topk_temperature": options.topk_temperature,
+        "anchor_span_tokens": options.anchor_span_tokens,
+        "first_anchor_probability": options.first_anchor_probability,
+        "anchor_margin_min": options.anchor_margin_min,
+        "anchor_margin_top_fraction": options.anchor_margin_top_fraction,
         "format": OMLX_DRAFT_FORMAT,
     }
     (options.output_dir / "dflasher_build_manifest.json").write_text(
@@ -1539,8 +2622,14 @@ def build_omlx_draft(options: OmlxBuildOptions) -> Path:
     return options.output_dir
 
 
-def _prompt_tokens(tokenizer, prompt: str):
+def _prompt_tokens(tokenizer, prompt: str, *, use_chat_template: bool = False):
     _mx, _nn, _optim, _mlx_lm_load, _make_prompt_cache, _make_sampler = _import_mlx()
+    if use_chat_template and hasattr(tokenizer, "apply_chat_template"):
+        return tokenizer.apply_chat_template(
+            [{"role": "user", "content": prompt}],
+            tokenize=True,
+            add_generation_prompt=True,
+        )
     add_special_tokens = getattr(tokenizer, "bos_token", None) is None or not prompt.startswith(
         str(getattr(tokenizer, "bos_token", ""))
     )
@@ -1567,8 +2656,10 @@ def _validate_prompt_context(
     prompt: str,
     max_new_tokens: int,
     max_position_embeddings: int,
+    *,
+    use_chat_template: bool = False,
 ) -> int:
-    prompt_len = len(_prompt_tokens(tokenizer, prompt))
+    prompt_len = len(_prompt_tokens(tokenizer, prompt, use_chat_template=use_chat_template))
     if prompt_len + max_new_tokens > max_position_embeddings:
         raise ValueError(
             "Prompt exceeds source context window: "
@@ -1578,13 +2669,23 @@ def _validate_prompt_context(
     return prompt_len
 
 
-def greedy_omlx_tokens(model, tokenizer, prompt: str, max_new_tokens: int) -> list[int]:
+def greedy_omlx_tokens(
+    model,
+    tokenizer,
+    prompt: str,
+    max_new_tokens: int,
+    *,
+    use_chat_template: bool = False,
+) -> list[int]:
     mx, _nn, _optim, _mlx_lm_load, make_prompt_cache, make_sampler = _import_mlx()
     if max_new_tokens < 0:
         raise ValueError("max_new_tokens must be non-negative.")
     if max_new_tokens == 0:
         return []
-    prompt_ids = mx.array(_prompt_tokens(tokenizer, prompt), dtype=mx.uint32)
+    prompt_ids = mx.array(
+        _prompt_tokens(tokenizer, prompt, use_chat_template=use_chat_template),
+        dtype=mx.uint32,
+    )
     cache = make_prompt_cache(model)
     sampler = make_sampler(temp=0.0)
     logits = model(prompt_ids[None, :], cache)
@@ -1612,6 +2713,14 @@ def _generate_with_dflash_mlx_runtime(
     draft_dir: Path,
     prompt: str,
     max_new_tokens: int,
+    verify_mode: str | None = "dflash",
+    draft_window_size: int | None = None,
+    draft_sink_size: int | None = None,
+    verify_len_cap: int | None = None,
+    block_tokens: int | None = None,
+    target_fa_window: int | None = None,
+    prefill_step_size: int | None = None,
+    use_chat_template: bool = False,
 ) -> tuple[str, list[int], float]:
     _ensure_omlx_app_site_packages()
     try:
@@ -1620,7 +2729,14 @@ def _generate_with_dflash_mlx_runtime(
     except ImportError as exc:
         raise RuntimeError("dflash_mlx generation support is unavailable.") from exc
 
-    runtime_context = build_offline_runtime_context(verify_mode="dflash")
+    runtime_context = build_offline_runtime_context(
+        verify_mode=verify_mode,
+        draft_window_size=draft_window_size,
+        draft_sink_size=draft_sink_size,
+        verify_len_cap=verify_len_cap,
+        target_fa_window=target_fa_window,
+        prefill_step_size=prefill_step_size,
+    )
     bundle = load_runtime_bundle(
         model_ref=source_model,
         draft_ref=str(draft_dir),
@@ -1628,7 +2744,14 @@ def _generate_with_dflash_mlx_runtime(
         verify_config=runtime_context.verify,
         lazy=True,
     )
-    return _generate_with_dflash_mlx_bundle(bundle, runtime_context, prompt, max_new_tokens)
+    return _generate_with_dflash_mlx_bundle(
+        bundle,
+        runtime_context,
+        prompt,
+        max_new_tokens,
+        block_tokens=block_tokens,
+        use_chat_template=use_chat_template,
+    )
 
 
 def _generate_with_dflash_mlx_bundle(
@@ -1636,6 +2759,8 @@ def _generate_with_dflash_mlx_bundle(
     runtime_context,
     prompt: str,
     max_new_tokens: int,
+    block_tokens: int | None = None,
+    use_chat_template: bool = False,
 ) -> tuple[str, list[int], float]:
     try:
         from dflash_mlx.engine.events import SummaryEvent, TokenEvent
@@ -1651,7 +2776,8 @@ def _generate_with_dflash_mlx_bundle(
         draft_backend=bundle.draft_backend,
         prompt=prompt,
         max_new_tokens=max_new_tokens,
-        use_chat_template=False,
+        block_tokens=block_tokens,
+        use_chat_template=use_chat_template,
         stop_token_ids=get_stop_token_ids(bundle.tokenizer),
         runtime_context=runtime_context,
     )
@@ -1671,7 +2797,13 @@ def _generate_with_dflash_mlx_bundle(
     return _decode_omlx_tokens(bundle.tokenizer, tokens), tokens, acceptance
 
 
-def _greedy_dflash_mlx_tokens(bundle, prompt: str, max_new_tokens: int) -> list[int]:
+def _greedy_dflash_mlx_tokens(
+    bundle,
+    prompt: str,
+    max_new_tokens: int,
+    *,
+    use_chat_template: bool = False,
+) -> list[int]:
     if max_new_tokens < 1:
         return []
     try:
@@ -1683,22 +2815,28 @@ def _greedy_dflash_mlx_tokens(bundle, prompt: str, max_new_tokens: int) -> list[
     prompt_tokens = prepare_prompt_tokens(
         bundle.tokenizer,
         prompt,
-        use_chat_template=False,
+        use_chat_template=use_chat_template,
     )
     target_cache = bundle.target_ops.make_cache(
         bundle.target_model,
         enable_speculative_linear_cache=True,
     )
-    logits, _captured = bundle.target_ops.verify_block(
-        target_model=bundle.target_model,
-        verify_ids=mx.array(prompt_tokens, dtype=mx.uint32)[None, :],
-        target_cache=target_cache,
-        capture_layer_ids=set(),
+    logits = _dflash_mlx_runtime_prefill_logits(
+        bundle.target_ops,
+        bundle.target_model,
+        target_cache,
+        prompt_tokens,
+        mx=mx,
     )
     token = greedy_tokens_with_mask(logits[:, -1, :], None).reshape(-1)
     mx.eval(token)
     tokens = [int(token.item())]
-    stop_ids = set(_eos_token_ids(bundle.tokenizer))
+    try:
+        from dflash_mlx.runtime import get_stop_token_ids
+
+        stop_ids = set(int(token_id) for token_id in get_stop_token_ids(bundle.tokenizer))
+    except ImportError:
+        stop_ids = set(_eos_token_ids(bundle.tokenizer))
     for _ in range(max_new_tokens - 1):
         if tokens[-1] in stop_ids:
             break
@@ -1719,6 +2857,14 @@ def generate_omlx_dflash(
     draft_dir: Path,
     prompt: str,
     max_new_tokens: int = 64,
+    verify_mode: str | None = "dflash",
+    draft_window_size: int | None = None,
+    draft_sink_size: int | None = None,
+    verify_len_cap: int | None = None,
+    block_tokens: int | None = None,
+    target_fa_window: int | None = None,
+    prefill_step_size: int | None = None,
+    use_chat_template: bool = False,
 ) -> tuple[str, list[int], float]:
     source_model = resolve_omlx_source_model(source_model)
     _mx, _nn, _optim, mlx_lm_load, _make_prompt_cache, _make_sampler = _import_mlx()
@@ -1729,6 +2875,14 @@ def generate_omlx_dflash(
             draft_dir,
             prompt,
             max_new_tokens,
+            verify_mode=verify_mode,
+            draft_window_size=draft_window_size,
+            draft_sink_size=draft_sink_size,
+            verify_len_cap=verify_len_cap,
+            block_tokens=block_tokens,
+            target_fa_window=target_fa_window,
+            prefill_step_size=prefill_step_size,
+            use_chat_template=use_chat_template,
         )
     if runtime.stream_generate is None:
         raise RuntimeError("DFlash stream_generate is unavailable.")
@@ -1740,6 +2894,7 @@ def generate_omlx_dflash(
         prompt,
         max_new_tokens,
         int(_config_value(source_config, "max_position_embeddings", 2048)),
+        use_chat_template=use_chat_template,
     )
     draft = load_omlx_draft(draft_dir)
     text_parts: list[str] = []
@@ -1766,6 +2921,14 @@ def evaluate_omlx_dflash(
     draft_dir: Path,
     prompts: list[str],
     max_new_tokens: int = 32,
+    verify_mode: str | None = "dflash",
+    draft_window_size: int | None = None,
+    draft_sink_size: int | None = None,
+    verify_len_cap: int | None = None,
+    block_tokens: int | None = None,
+    target_fa_window: int | None = None,
+    prefill_step_size: int | None = None,
+    use_chat_template: bool = False,
 ) -> OmlxEvalResult:
     source_model = resolve_omlx_source_model(source_model)
     _mx, _nn, _optim, mlx_lm_load, _make_prompt_cache, _make_sampler = _import_mlx()
@@ -1777,7 +2940,14 @@ def evaluate_omlx_dflash(
             from dflash_mlx.runtime.context import build_offline_runtime_context
         except ImportError as exc:
             raise RuntimeError("dflash_mlx generation support is unavailable.") from exc
-        runtime_context = build_offline_runtime_context(verify_mode="dflash")
+        runtime_context = build_offline_runtime_context(
+            verify_mode=verify_mode,
+            draft_window_size=draft_window_size,
+            draft_sink_size=draft_sink_size,
+            verify_len_cap=verify_len_cap,
+            target_fa_window=target_fa_window,
+            prefill_step_size=prefill_step_size,
+        )
         bundle = load_runtime_bundle(
             model_ref=source_model,
             draft_ref=str(draft_dir),
@@ -1797,14 +2967,22 @@ def evaluate_omlx_dflash(
                 prompt,
                 max_new_tokens,
                 max_context,
+                use_chat_template=use_chat_template,
             )
             max_prompt_tokens = max(max_prompt_tokens, prompt_tokens)
-            expected = _greedy_dflash_mlx_tokens(bundle, prompt, max_new_tokens)
+            expected = _greedy_dflash_mlx_tokens(
+                bundle,
+                prompt,
+                max_new_tokens,
+                use_chat_template=use_chat_template,
+            )
             _text, actual, acceptance = _generate_with_dflash_mlx_bundle(
                 bundle,
                 runtime_context,
                 prompt,
                 max_new_tokens,
+                block_tokens=block_tokens,
+                use_chat_template=use_chat_template,
             )
             actual = actual[: len(expected)]
             if actual == expected:
@@ -1831,9 +3009,21 @@ def evaluate_omlx_dflash(
     draft_committed_total = 0
     max_prompt_tokens = 0
     for prompt in prompts:
-        prompt_tokens = _validate_prompt_context(tokenizer, prompt, max_new_tokens, max_context)
+        prompt_tokens = _validate_prompt_context(
+            tokenizer,
+            prompt,
+            max_new_tokens,
+            max_context,
+            use_chat_template=use_chat_template,
+        )
         max_prompt_tokens = max(max_prompt_tokens, prompt_tokens)
-        expected = greedy_omlx_tokens(model, tokenizer, prompt, max_new_tokens)
+        expected = greedy_omlx_tokens(
+            model,
+            tokenizer,
+            prompt,
+            max_new_tokens,
+            use_chat_template=use_chat_template,
+        )
         actual: list[int] = []
         accepted: list[int] = []
         for response in stream_generate(
@@ -1867,7 +3057,7 @@ def evaluate_omlx_dflash(
 
 def _resolve_omlx_app_patch_paths(
     app_path: str | Path,
-) -> tuple[Path, Path, Path, Path, Path]:
+) -> tuple[Path, Path, Path, Path, Path, Path]:
     app = Path(app_path).expanduser()
     contents = app / "Contents"
     if not contents.exists():
@@ -1878,11 +3068,13 @@ def _resolve_omlx_app_patch_paths(
     for site_package in site_packages:
         target_ops_path = site_package / "dflash_mlx" / "engine" / "target_ops.py"
         target_backend_path = site_package / "dflash_mlx" / "engine" / "target_minimax_m2.py"
+        spec_epoch_path = site_package / "dflash_mlx" / "engine" / "spec_epoch.py"
         dflash_engine_path = contents / "Resources" / "omlx" / "engine" / "dflash.py"
         model_settings_path = contents / "Resources" / "omlx" / "model_settings.py"
         dflash_lifecycle_path = contents / "Resources" / "omlx" / "patches" / "dflash_lifecycle.py"
         if (
             target_ops_path.exists()
+            and spec_epoch_path.exists()
             and dflash_engine_path.exists()
             and model_settings_path.exists()
             and dflash_lifecycle_path.exists()
@@ -1890,6 +3082,7 @@ def _resolve_omlx_app_patch_paths(
             return (
                 target_ops_path,
                 target_backend_path,
+                spec_epoch_path,
                 dflash_engine_path,
                 model_settings_path,
                 dflash_lifecycle_path,
@@ -2057,6 +3250,305 @@ def _patch_omlx_dflash_lifecycle_text(text: str) -> str:
     return text.replace(marker, insert, 1)
 
 
+def _patch_dflash_spec_epoch_text(text: str) -> str:
+    if (
+        "correct_committed_block_after_acceptance" in text
+        and "commit_correction" in text
+        and "DFLASH_MINIMAX_BLOCK2_EARLY_REJECT" in text
+    ):
+        return text
+    patched = text
+    needs_commit_correction_patch = not (
+        "correct_committed_block_after_acceptance" in patched
+        and "commit_correction" in patched
+    )
+    hidden_block = """            if profile_cycles:
+                acceptance_cycle_ns = time.perf_counter_ns() - acceptance_start_ns
+            hidden_extract_start_ns = time.perf_counter_ns() if profile_cycles else 0
+            committed_hidden = target_ops.extract_context_feature(
+                verify_hidden_states,
+                target_layer_id_list,
+            )[:, : (1 + acceptance_len), :]
+            if profile_cycles:
+                mx.eval(committed_hidden, posterior)
+            else:
+                mx.async_eval(committed_hidden)
+            if profile_cycles:
+                hidden_extract_cycle_ns = time.perf_counter_ns() - hidden_extract_start_ns
+
+            commit_count = 1 + acceptance_len
+            committed_segment = verify_token_ids[:commit_count]
+"""
+    hidden_replacement = """            if profile_cycles:
+                acceptance_cycle_ns = time.perf_counter_ns() - acceptance_start_ns
+            commit_count = 1 + acceptance_len
+            committed_segment = verify_token_ids[:commit_count]
+            hidden_extract_start_ns = time.perf_counter_ns() if profile_cycles else 0
+            commit_correction = None
+            commit_corrector = getattr(
+                target_ops,
+                "correct_committed_block_after_acceptance",
+                None,
+            )
+            if callable(commit_corrector):
+                commit_correction = commit_corrector(
+                    target_model=target_model,
+                    target_cache=target_cache,
+                    verify_token_ids=verify_ids,
+                    target_layer_ids=target_layer_id_list,
+                    capture_layer_ids=capture_layer_ids,
+                    prefix_len=cycle_prefix_len,
+                    acceptance_length=acceptance_len,
+                    suppress_token_mask=suppress_token_mask,
+                )
+            if commit_correction is None:
+                committed_hidden = target_ops.extract_context_feature(
+                    verify_hidden_states,
+                    target_layer_id_list,
+                )[:, :commit_count, :]
+                if profile_cycles:
+                    mx.eval(committed_hidden, posterior)
+                else:
+                    mx.async_eval(committed_hidden)
+            else:
+                committed_hidden = commit_correction["committed_hidden"]
+            if profile_cycles:
+                hidden_extract_cycle_ns = time.perf_counter_ns() - hidden_extract_start_ns
+
+"""
+    if needs_commit_correction_patch:
+        if hidden_block not in patched:
+            raise ValueError("Could not patch spec_epoch.py hidden commit block.")
+        patched = patched.replace(hidden_block, hidden_replacement, 1)
+        patched = patched.replace(
+            "            state.last_cycle_logits = verify_logits[:, acceptance_len, :]\n",
+            """            if commit_correction is None:
+                state.last_cycle_logits = verify_logits[:, acceptance_len, :]
+            else:
+                state.last_cycle_logits = commit_correction["last_cycle_logits"]
+""",
+            1,
+        )
+    replay_block = """            replay_cycle_ns = target_ops.restore_after_acceptance(
+                target_cache,
+                target_len=state.start,
+                acceptance_length=acceptance_len,
+                drafted_tokens=max(0, verify_token_count - 1),
+            )
+"""
+    replay_replacement = """            if commit_correction is None:
+                replay_cycle_ns = target_ops.restore_after_acceptance(
+                    target_cache,
+                    target_len=state.start,
+                    acceptance_length=acceptance_len,
+                    drafted_tokens=max(0, verify_token_count - 1),
+                )
+            else:
+                replay_cycle_ns = int(commit_correction.get("replay_ns", 0) or 0)
+"""
+    if needs_commit_correction_patch:
+        if replay_block not in patched:
+            raise ValueError("Could not patch spec_epoch.py rollback block.")
+        patched = patched.replace(replay_block, replay_replacement, 1)
+        patched = patched.replace(
+            "            staged_first_next = posterior[acceptance_len : acceptance_len + 1]\n",
+            """            if commit_correction is None:
+                staged_first_next = posterior[acceptance_len : acceptance_len + 1]
+            else:
+                staged_first_next = commit_correction["staged_first_next"]
+""",
+            1,
+        )
+    if "DFLASH_MINIMAX_BLOCK2_EARLY_REJECT" not in patched:
+        verify_block = """            verify_token_count = verify_token_count_for_block(block_len, verify_len_cap)
+            if profile_cycles or block_len <= 1:
+                verify_token_ids = block_token_ids[:verify_token_count]
+            elif verify_token_count <= 1:
+                verify_token_ids = current_staged_first[:1]
+            else:
+                verify_token_ids = mx.concatenate(
+                    [current_staged_first[:1], drafted[: verify_token_count - 1]],
+                    axis=0,
+                )
+"""
+        verify_replacement = """            verify_token_count = verify_token_count_for_block(block_len, verify_len_cap)
+            serial_block2_verify = (
+                int(block_len) == 2
+                and int(verify_token_count) == 2
+                and not profile_cycles
+                and drafted is not None
+                and getattr(target_ops, "backend_name", "") == "minimax_m2"
+                and _omlx_env_flag("DFLASH_MINIMAX_BLOCK2_EARLY_REJECT", True)
+            )
+            if profile_cycles or block_len <= 1:
+                verify_token_ids = block_token_ids[:verify_token_count]
+            elif verify_token_count <= 1:
+                verify_token_ids = current_staged_first[:1]
+            elif serial_block2_verify:
+                verify_token_ids = current_staged_first[:1]
+            else:
+                verify_token_ids = mx.concatenate(
+                    [current_staged_first[:1], drafted[: verify_token_count - 1]],
+                    axis=0,
+                )
+"""
+        if verify_block not in patched:
+            raise ValueError("Could not patch spec_epoch.py MiniMax block2 verify input.")
+        patched = patched.replace(verify_block, verify_replacement, 1)
+        acceptance_block = """            acceptance_start_ns = time.perf_counter_ns() if profile_cycles else 0
+            posterior = greedy_tokens_with_mask(verify_logits[0], suppress_token_mask)
+            if not profile_cycles:
+                mx.async_eval(posterior)
+            acceptance_len = int(
+                _match_acceptance_length(verify_token_ids[1:], posterior[:-1]).item()
+            )
+            state.acceptance_history.append(acceptance_len)
+"""
+        acceptance_replacement = """            acceptance_start_ns = time.perf_counter_ns() if profile_cycles else 0
+            posterior = greedy_tokens_with_mask(verify_logits[0], suppress_token_mask)
+            if not profile_cycles:
+                mx.async_eval(posterior)
+            serial_committed_hidden = None
+            serial_last_cycle_logits = None
+            serial_staged_first_next = None
+            if serial_block2_verify:
+                acceptance_len = int((drafted[:1] == posterior[:1]).item())
+                if acceptance_len > 0:
+                    second_verify_ids = drafted[:1][None]
+                    second_verify_start_ns = time.perf_counter_ns()
+                    second_verify_logits, second_verify_hidden_states = target_ops.verify_block(
+                        target_model=target_model,
+                        verify_ids=second_verify_ids,
+                        target_cache=target_cache,
+                        capture_layer_ids=capture_layer_ids,
+                    )
+                    if profile_cycles:
+                        eval_logits_and_captured(
+                            second_verify_logits,
+                            second_verify_hidden_states,
+                        )
+                    second_verify_cycle_ns = time.perf_counter_ns() - second_verify_start_ns
+                    verify_cycle_ns += second_verify_cycle_ns
+                    verify_ns_total += second_verify_cycle_ns
+                    first_committed_hidden = target_ops.extract_context_feature(
+                        verify_hidden_states,
+                        target_layer_id_list,
+                    )[:, :1, :]
+                    second_committed_hidden = target_ops.extract_context_feature(
+                        second_verify_hidden_states,
+                        target_layer_id_list,
+                    )[:, :1, :]
+                    serial_committed_hidden = mx.concatenate(
+                        [first_committed_hidden, second_committed_hidden],
+                        axis=1,
+                    )
+                    second_posterior = greedy_tokens_with_mask(
+                        second_verify_logits[0],
+                        suppress_token_mask,
+                    )
+                    posterior = mx.concatenate([posterior[:1], second_posterior[:1]], axis=0)
+                    verify_token_ids = mx.concatenate(
+                        [current_staged_first[:1], drafted[:1]],
+                        axis=0,
+                    )
+                    serial_last_cycle_logits = second_verify_logits[:, 0, :]
+                    serial_staged_first_next = second_posterior[:1]
+                else:
+                    serial_committed_hidden = target_ops.extract_context_feature(
+                        verify_hidden_states,
+                        target_layer_id_list,
+                    )[:, :1, :]
+                    serial_last_cycle_logits = verify_logits[:, 0, :]
+                    serial_staged_first_next = posterior[:1]
+            else:
+                acceptance_len = int(
+                    _match_acceptance_length(verify_token_ids[1:], posterior[:-1]).item()
+                )
+            state.acceptance_history.append(acceptance_len)
+"""
+        if acceptance_block not in patched:
+            raise ValueError("Could not patch spec_epoch.py MiniMax block2 acceptance.")
+        patched = patched.replace(acceptance_block, acceptance_replacement, 1)
+        patched = patched.replace(
+            "            if callable(commit_corrector):\n",
+            "            if callable(commit_corrector) and not serial_block2_verify:\n",
+            1,
+        )
+        committed_block = """            if commit_correction is None:
+                committed_hidden = target_ops.extract_context_feature(
+                    verify_hidden_states,
+                    target_layer_id_list,
+                )[:, :commit_count, :]
+                if profile_cycles:
+                    mx.eval(committed_hidden, posterior)
+                else:
+                    mx.async_eval(committed_hidden)
+"""
+        committed_replacement = """            if commit_correction is None:
+                if serial_committed_hidden is not None:
+                    committed_hidden = serial_committed_hidden
+                else:
+                    committed_hidden = target_ops.extract_context_feature(
+                        verify_hidden_states,
+                        target_layer_id_list,
+                    )[:, :commit_count, :]
+                if profile_cycles:
+                    mx.eval(committed_hidden, posterior)
+                else:
+                    mx.async_eval(committed_hidden)
+"""
+        if committed_block not in patched:
+            raise ValueError("Could not patch spec_epoch.py MiniMax block2 hidden commit.")
+        patched = patched.replace(committed_block, committed_replacement, 1)
+        patched = patched.replace(
+            """            if commit_correction is None:
+                state.last_cycle_logits = verify_logits[:, acceptance_len, :]
+            else:
+                state.last_cycle_logits = commit_correction["last_cycle_logits"]
+""",
+            """            if commit_correction is None:
+                if serial_last_cycle_logits is not None:
+                    state.last_cycle_logits = serial_last_cycle_logits
+                else:
+                    state.last_cycle_logits = verify_logits[:, acceptance_len, :]
+            else:
+                state.last_cycle_logits = commit_correction["last_cycle_logits"]
+""",
+            1,
+        )
+        patched = patched.replace(
+            "                    drafted_tokens=max(0, verify_token_count - 1),\n",
+            """                    drafted_tokens=(
+                        0 if serial_block2_verify else max(0, verify_token_count - 1)
+                    ),
+""",
+            1,
+        )
+        patched = patched.replace(
+            """            if commit_correction is None:
+                staged_first_next = posterior[acceptance_len : acceptance_len + 1]
+            else:
+                staged_first_next = commit_correction["staged_first_next"]
+""",
+            """            if commit_correction is None:
+                if serial_staged_first_next is not None:
+                    staged_first_next = serial_staged_first_next
+                else:
+                    staged_first_next = posterior[acceptance_len : acceptance_len + 1]
+            else:
+                staged_first_next = commit_correction["staged_first_next"]
+""",
+            1,
+        )
+    if (
+        "correct_committed_block_after_acceptance" not in patched
+        or "commit_correction" not in patched
+        or "DFLASH_MINIMAX_BLOCK2_EARLY_REJECT" not in patched
+    ):
+        raise ValueError("Could not patch spec_epoch.py MiniMax commit correction.")
+    return patched
+
+
 def _write_text_with_backup(path: Path, text: str) -> None:
     backup_path = path.with_suffix(path.suffix + ".dflasher.bak")
     if path.exists() and not backup_path.exists():
@@ -2075,6 +3567,7 @@ def patch_omlx_app_for_minimax(
     (
         target_ops_path,
         target_backend_path,
+        spec_epoch_path,
         dflash_engine_path,
         model_settings_path,
         dflash_lifecycle_path,
@@ -2095,6 +3588,11 @@ def patch_omlx_app_for_minimax(
     patched_target_ops = _patch_target_ops_text(target_ops_text)
     if patched_target_ops != target_ops_text:
         changed.append(target_ops_path)
+
+    spec_epoch_text = spec_epoch_path.read_text()
+    patched_spec_epoch = _patch_dflash_spec_epoch_text(spec_epoch_text)
+    if patched_spec_epoch != spec_epoch_text:
+        changed.append(spec_epoch_path)
 
     dflash_engine_text = dflash_engine_path.read_text()
     patched_dflash_engine = _patch_omlx_dflash_text(dflash_engine_text)
@@ -2119,6 +3617,8 @@ def patch_omlx_app_for_minimax(
                 _write_text_with_backup(target_backend_path, target_backend_source)
             if patched_target_ops != target_ops_text:
                 _write_text_with_backup(target_ops_path, patched_target_ops)
+            if patched_spec_epoch != spec_epoch_text:
+                _write_text_with_backup(spec_epoch_path, patched_spec_epoch)
             if patched_dflash_engine != dflash_engine_text:
                 _write_text_with_backup(dflash_engine_path, patched_dflash_engine)
             if patched_model_settings != model_settings_text:
@@ -2137,6 +3637,7 @@ def patch_omlx_app_for_minimax(
         app_path=Path(app_path).expanduser(),
         target_ops_path=target_ops_path,
         target_backend_path=target_backend_path,
+        spec_epoch_path=spec_epoch_path,
         dflash_engine_path=dflash_engine_path,
         model_settings_path=model_settings_path,
         dflash_lifecycle_path=dflash_lifecycle_path,
